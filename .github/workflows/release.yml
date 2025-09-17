@@ -1,0 +1,61 @@
+name: release-builds
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            triplet: x86-windows
+            preset: x86-release
+          - arch: x64
+            triplet: x64-windows
+            preset: x64-release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+
+      - name: Configure (${{ matrix.preset }})
+        run: cmake --preset ${{ matrix.preset }}
+        env:
+          VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
+
+      # Build only the two targets we want to ship
+      - name: Build Release (${{ matrix.preset }})
+        run: cmake --build --preset ${{ matrix.preset }} --config Release --parallel --target pipetap-gui pipetap-dll
+
+      - name: Package GUI and DLL (${{ matrix.arch }})
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $preset = "${{ matrix.preset }}"
+          $binDir = Join-Path "out/build" $preset | Join-Path -ChildPath "bin/Release"
+          $gui = Join-Path $binDir "pipetap-gui.exe"
+          $dll = Join-Path $binDir "pipetap-dll.dll"
+
+          if (!(Test-Path $gui)) { throw "Missing $gui" }
+          if (!(Test-Path $dll)) { throw "Missing $dll" }
+
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $zipName = "pipetap-${{ github.ref_name }}-${{ matrix.arch }}.zip"
+
+          Compress-Archive -Path @($gui, $dll) -DestinationPath (Join-Path "artifacts" $zipName) -Force
+
+      - name: Upload assets to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: artifacts/*.zip

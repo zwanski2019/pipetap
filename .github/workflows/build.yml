@@ -1,0 +1,42 @@
+name: build-artefacts
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            triplet: x86-windows
+            preset: x86-release
+          - arch: x64
+            triplet: x64-windows
+            preset: x64-release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+
+      - name: CMake configure (${{ matrix.preset }})
+        run: cmake --preset ${{ matrix.preset }}
+        env:
+          VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
+
+      - name: CMake build (${{ matrix.preset }})
+        run: cmake --build --preset ${{ matrix.preset }} --config Release --parallel
+
+      - name: Upload artifacts (${{ matrix.arch }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipetap-${{ matrix.arch }}-Release
+          path: |
+            out/build/${{ matrix.preset }}/bin/Release/pipetap-gui.exe
+            out/build/${{ matrix.preset }}/bin/Release/pipetap-dll.dll
