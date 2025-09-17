@@ -1,6 +1,7 @@
 # pipetap (beta)
 
 [![Twitter](https://img.shields.io/badge/twitter-%40leonjza-blue.svg)](https://x.com/leonjza)
+[![build-artefacts](https://github.com/sensepost/pipetap/actions/workflows/build.yml/badge.svg)](https://github.com/sensepost/pipetap/actions/workflows/build.yml)
 
 `pipetap` helps you observe, intercept, and replay traffic over [Windows Named Pipes](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipes).  
 
