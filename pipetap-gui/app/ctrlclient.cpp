@@ -63,6 +63,26 @@ namespace pipetap::ctrlclient {
         if (cmd_to_cancel != INVALID_HANDLE_VALUE) CloseHandle(cmd_to_cancel);
     }
 
+    void CtrlClient::DisconnectHandles(bool cancel_io)
+    {
+        HANDLE ev_to_close = INVALID_HANDLE_VALUE;
+        HANDLE cmd_to_close = INVALID_HANDLE_VALUE;
+        {
+            std::lock_guard<std::mutex> lk(wr_mtx_);
+            ev_to_close = h_ev_;  h_ev_ = INVALID_HANDLE_VALUE;
+            cmd_to_close = h_cmd_; h_cmd_ = INVALID_HANDLE_VALUE;
+            connected.store(false, std::memory_order_release);
+        }
+
+        if (cancel_io) {
+            if (cmd_to_close != INVALID_HANDLE_VALUE) CancelIoEx(cmd_to_close, nullptr);
+            if (ev_to_close != INVALID_HANDLE_VALUE) CancelIoEx(ev_to_close, nullptr);
+        }
+
+        if (cmd_to_close != INVALID_HANDLE_VALUE) CloseHandle(cmd_to_close);
+        if (ev_to_close != INVALID_HANDLE_VALUE) CloseHandle(ev_to_close);
+    }
+
     bool CtrlClient::SendTLV(uint16_t type, const void* v1, uint32_t n1, const void* v2, uint32_t n2) {
 
         std::vector<::pipetap::TlvFragment> fragments;
@@ -98,18 +118,7 @@ namespace pipetap::ctrlclient {
                 this->SetLastError(p, os.str());
             }
 
-            HANDLE ev_to_close = INVALID_HANDLE_VALUE;
-            HANDLE cmd_to_close = INVALID_HANDLE_VALUE;
-            {
-                std::lock_guard<std::mutex> lk(wr_mtx_);
-                ev_to_close = h_ev_;  h_ev_ = INVALID_HANDLE_VALUE;
-                cmd_to_close = h_cmd_; h_cmd_ = INVALID_HANDLE_VALUE;
-                connected.store(false, std::memory_order_release);
-            }
-
-            if (cmd_to_close != INVALID_HANDLE_VALUE) { CancelIoEx(cmd_to_close, nullptr); CloseHandle(cmd_to_close); }
-            if (ev_to_close != INVALID_HANDLE_VALUE) { CancelIoEx(ev_to_close, nullptr); CloseHandle(ev_to_close); }
-
+            DisconnectHandles(true);
             return false;
         }
         return true;
@@ -132,17 +141,7 @@ namespace pipetap::ctrlclient {
             if (cur_pid == 0) {
                 if (connected.load(std::memory_order_acquire)) {
                     pipetap::log::App.Infof("CtrlClient::Loop: pid=0 -> close handles");
-
-                    HANDLE ev_to_close = INVALID_HANDLE_VALUE;
-                    HANDLE cmd_to_close = INVALID_HANDLE_VALUE;
-                    {
-                        std::lock_guard<std::mutex> lk(wr_mtx_);
-                        ev_to_close = h_ev_;  h_ev_ = INVALID_HANDLE_VALUE;
-                        cmd_to_close = h_cmd_; h_cmd_ = INVALID_HANDLE_VALUE;
-                        connected.store(false, std::memory_order_release);
-                    }
-                    if (ev_to_close != INVALID_HANDLE_VALUE) CloseHandle(ev_to_close);
-                    if (cmd_to_close != INVALID_HANDLE_VALUE) CloseHandle(cmd_to_close);
+                    DisconnectHandles(false);
                     last_pid = 0;
                 }
                 this->ClearLastError();
@@ -155,16 +154,7 @@ namespace pipetap::ctrlclient {
                 pipetap::log::App.Infof("CtrlClient::Loop: pid changed %lu -> %lu",
                     (unsigned long)last_pid, (unsigned long)cur_pid);
 
-                HANDLE ev_to_close = INVALID_HANDLE_VALUE;
-                HANDLE cmd_to_close = INVALID_HANDLE_VALUE;
-                {
-                    std::lock_guard<std::mutex> lk(wr_mtx_);
-                    ev_to_close = h_ev_;  h_ev_ = INVALID_HANDLE_VALUE;
-                    cmd_to_close = h_cmd_; h_cmd_ = INVALID_HANDLE_VALUE;
-                    connected.store(false, std::memory_order_release);
-                }
-                if (ev_to_close != INVALID_HANDLE_VALUE) CloseHandle(ev_to_close);
-                if (cmd_to_close != INVALID_HANDLE_VALUE) CloseHandle(cmd_to_close);
+                DisconnectHandles(false);
             }
 
             if (!connected.load(std::memory_order_acquire)) {
@@ -242,17 +232,7 @@ namespace pipetap::ctrlclient {
                 pipetap::log::App.Errorf("CtrlClient::Loop: header read failed -> disconnect le=%lu", (unsigned long)le);
                 this->SetLastError(cur_pid, std::string("Read header failed: ") + FormatLeA(le));
 
-                HANDLE ev_to_close = INVALID_HANDLE_VALUE;
-                HANDLE cmd_to_close = INVALID_HANDLE_VALUE;
-                {
-                    std::lock_guard<std::mutex> lk(wr_mtx_);
-                    ev_to_close = h_ev_;  h_ev_ = INVALID_HANDLE_VALUE;
-                    cmd_to_close = h_cmd_; h_cmd_ = INVALID_HANDLE_VALUE;
-                    connected.store(false, std::memory_order_release);
-                }
-                if (ev_to_close != INVALID_HANDLE_VALUE) CloseHandle(ev_to_close);
-                if (cmd_to_close != INVALID_HANDLE_VALUE) CloseHandle(cmd_to_close);
-
+                DisconnectHandles(false);
                 continue;
             }
 
@@ -260,17 +240,7 @@ namespace pipetap::ctrlclient {
                 pipetap::log::App.Errorf("CtrlClient::Loop: invalid length %u -> disconnect", (unsigned)hdr.length);
                 this->SetLastError(cur_pid, "Invalid message length from events pipe");
 
-                HANDLE ev_to_close = INVALID_HANDLE_VALUE;
-                HANDLE cmd_to_close = INVALID_HANDLE_VALUE;
-                {
-                    std::lock_guard<std::mutex> lk(wr_mtx_);
-                    ev_to_close = h_ev_;  h_ev_ = INVALID_HANDLE_VALUE;
-                    cmd_to_close = h_cmd_; h_cmd_ = INVALID_HANDLE_VALUE;
-                    connected.store(false, std::memory_order_release);
-                }
-                if (ev_to_close != INVALID_HANDLE_VALUE) CloseHandle(ev_to_close);
-                if (cmd_to_close != INVALID_HANDLE_VALUE) CloseHandle(cmd_to_close);
-
+                DisconnectHandles(false);
                 continue;
             }
 
@@ -280,16 +250,7 @@ namespace pipetap::ctrlclient {
                 pipetap::log::App.Errorf("CtrlClient::Loop: value read failed -> disconnect le=%lu", (unsigned long)le);
                 this->SetLastError(cur_pid, std::string("Read value failed: ") + FormatLeA(le));
 
-                HANDLE ev_to_close = INVALID_HANDLE_VALUE;
-                HANDLE cmd_to_close = INVALID_HANDLE_VALUE;
-                {
-                    std::lock_guard<std::mutex> lk(wr_mtx_);
-                    ev_to_close = h_ev_;  h_ev_ = INVALID_HANDLE_VALUE;
-                    cmd_to_close = h_cmd_; h_cmd_ = INVALID_HANDLE_VALUE;
-                    connected.store(false, std::memory_order_release);
-                }
-                if (ev_to_close != INVALID_HANDLE_VALUE) CloseHandle(ev_to_close);
-                if (cmd_to_close != INVALID_HANDLE_VALUE) CloseHandle(cmd_to_close);
+                DisconnectHandles(false);
                 continue;
             }
 
@@ -306,16 +267,7 @@ namespace pipetap::ctrlclient {
             }
         }
 
-        HANDLE ev_to_close = INVALID_HANDLE_VALUE;
-        HANDLE cmd_to_close = INVALID_HANDLE_VALUE;
-        {
-            std::lock_guard<std::mutex> lk(wr_mtx_);
-            ev_to_close = h_ev_;  h_ev_ = INVALID_HANDLE_VALUE;
-            cmd_to_close = h_cmd_; h_cmd_ = INVALID_HANDLE_VALUE;
-            connected.store(false, std::memory_order_release);
-        }
-        if (ev_to_close != INVALID_HANDLE_VALUE) CloseHandle(ev_to_close);
-        if (cmd_to_close != INVALID_HANDLE_VALUE) CloseHandle(cmd_to_close);
+        DisconnectHandles(false);
 
         pipetap::log::App.Info("CtrlClient::Loop: exit");
     }

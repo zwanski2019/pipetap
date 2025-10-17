@@ -70,6 +70,7 @@ namespace pipetap::ctrlclient {
             std::lock_guard<std::mutex> lk(err_mtx_);
             SetLastErrorUnlocked(pid, msg);
         }
+        void DisconnectHandles(bool cancel_io);
     };
 
     CtrlClient& Control();
