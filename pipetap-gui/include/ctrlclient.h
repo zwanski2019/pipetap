@@ -48,8 +48,6 @@ namespace pipetap::ctrlclient {
 
     private:
         void Loop();
-        static bool ReadExact(HANDLE h, void* buf, DWORD len);
-
         std::thread        reader_;
         std::atomic_bool   run_{ false };
         HANDLE             h_ev_{ INVALID_HANDLE_VALUE };

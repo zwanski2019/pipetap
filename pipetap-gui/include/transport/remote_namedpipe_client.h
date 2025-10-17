@@ -4,6 +4,7 @@
 #define NOMINMAX
 #include "log.h"
 #include "pipetap/controlpipe.h"
+#include "pipetap/winpipe_helpers.h"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -274,20 +275,6 @@ namespace pipetap::transport {
             if (hEv_ && hEv_ != INVALID_HANDLE_VALUE) { CloseHandle(hEv_);  hEv_ = INVALID_HANDLE_VALUE; }
         }
 
-        static bool ReadExactMsg_(HANDLE h, void* buf, DWORD len) {
-            auto* p = static_cast<uint8_t*>(buf);
-            DWORD total = 0;
-            while (total < len) {
-                DWORD got = 0;
-                BOOL ok = ReadFile(h, p + total, len - total, &got, nullptr);
-                if (ok) { total += got; if (total == len) return true; continue; }
-                DWORD le = GetLastError();
-                if (le == ERROR_MORE_DATA && got > 0) { total += got; if (total == len) return true; continue; }
-                return false;
-            }
-            return true;
-        }
-
         static std::string CanonicalPipeTail_(std::string s) {
             for (auto& c : s) if (c == '/') c = '\\';
 
@@ -319,11 +306,10 @@ namespace pipetap::transport {
                 LogError(last_error_);
                 return false;
             }
-            PT_TlvHeader hdr{ type, meta_len + bytes_len };
-            std::vector<uint8_t> msg(sizeof(hdr) + meta_len + bytes_len);
-            std::memcpy(msg.data(), &hdr, sizeof(hdr));
-            if (meta_len && meta)   std::memcpy(msg.data() + sizeof(hdr), meta, meta_len);
-            if (bytes_len && bytes) std::memcpy(msg.data() + sizeof(hdr) + meta_len, bytes, bytes_len);
+            std::vector<::pipetap::TlvFragment> fragments;
+            if (meta_len && meta) fragments.push_back({ meta, meta_len });
+            if (bytes_len && bytes) fragments.push_back({ bytes, bytes_len });
+            auto msg = ::pipetap::BuildTlvMessage(type, fragments);
 
             DWORD wrote = 0;
             BOOL ok = WriteFile(hCmd_, msg.data(), (DWORD)msg.size(), &wrote, nullptr);
@@ -365,11 +351,13 @@ namespace pipetap::transport {
                 if (avail < sizeof(PT_TlvHeader)) { Sleep(1); continue; }
 
                 PT_TlvHeader hdr{};
-                if (!ReadExactMsg_(hEv_, &hdr, (DWORD)sizeof(hdr))) break;
+                if (!::pipetap::PipeReadExact(hEv_, &hdr, static_cast<DWORD>(sizeof(hdr)))) break;
                 if (hdr.length > (512u * 1024u * 1024u)) break;
 
                 std::vector<uint8_t> val(hdr.length);
-                if (hdr.length) { if (!ReadExactMsg_(hEv_, val.data(), hdr.length)) break; }
+                if (hdr.length) {
+                    if (!::pipetap::PipeReadExact(hEv_, val.data(), hdr.length)) break;
+                }
 
                 switch (hdr.type) {
                 case PT_HELLO:

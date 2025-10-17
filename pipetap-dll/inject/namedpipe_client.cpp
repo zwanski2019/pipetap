@@ -10,6 +10,7 @@
 #include <string>
 #include <memory>
 #include "pipetap/controlpipe.h"
+#include "pipetap/winpipe_helpers.h"
 #include "inject/hook_guards.h"
 #include "inject/pipe_utils.h"
 #include "inject/control_server.h"
@@ -22,30 +23,6 @@ namespace pipetap::inject {
     }
     static inline HANDLE atomic_exchange_handle(HANDLE& h, HANDLE hNew) {
         return (HANDLE)InterlockedExchangePointer((PVOID*)&h, hNew);
-    }
-
-    static bool read_exact_msg(HANDLE h, void* buf, DWORD len) {
-        SuppressHooksGuard _guard;
-        auto* p = static_cast<uint8_t*>(buf);
-        DWORD total = 0;
-
-        while (total < len) {
-            DWORD got = 0;
-            BOOL ok = ReadFile(h, p + total, len - total, &got, nullptr);
-            if (ok) {
-                total += got;
-                if (total == len) return true;
-                continue;
-            }
-            DWORD le = GetLastError();
-            if (le == ERROR_MORE_DATA && got > 0) {
-                total += got;
-                if (total == len) return true;
-                continue;
-            }
-            return false;
-        }
-        return true;
     }
 
     static std::atomic<uint64_t> g_proxyNextOpId{ 1 };
@@ -181,10 +158,13 @@ namespace pipetap::inject {
                     if (totalAvail == 0) { Sleep(1); continue; }
 
                     buf.resize(totalAvail);
-                    if (!read_exact_msg(h, buf.data(), totalAvail)) {
-                        DWORD le = GetLastError();
-                        self->notify_closed((le == ERROR_BROKEN_PIPE) ? 1u : 2u, le);
-                        break;
+                    {
+                        SuppressHooksGuard g;
+                        if (!::pipetap::PipeReadExact(h, buf.data(), totalAvail)) {
+                            DWORD le = GetLastError();
+                            self->notify_closed((le == ERROR_BROKEN_PIPE) ? 1u : 2u, le);
+                            break;
+                        }
                     }
 
                     self->owner->send_pipe_io(PT_PIPE_READ, h, buf.data(), (uint32_t)buf.size(),

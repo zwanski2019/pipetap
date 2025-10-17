@@ -12,6 +12,7 @@
 
 #include "pipetap/log.h"
 #include "pipetap/controlpipe.h"
+#include "pipetap/winpipe_helpers.h"
 
 #include "inject/control_server.h"
 #include "inject/hook_guards.h"
@@ -27,30 +28,6 @@ namespace pipetap::inject {
     }
     static inline HANDLE atomic_exchange_handle(HANDLE& h, HANDLE hNew) {
         return (HANDLE)InterlockedExchangePointer((PVOID*)&h, hNew);
-    }
-
-    static bool read_exact_msg(HANDLE h, void* buf, DWORD len) {
-        SuppressHooksGuard _guard;
-        auto* p = static_cast<uint8_t*>(buf);
-        DWORD total = 0;
-
-        while (total < len) {
-            DWORD got = 0;
-            BOOL ok = ReadFile(h, p + total, len - total, &got, nullptr);
-            if (ok) {
-                total += got;
-                if (total == len) return true;
-                continue;
-            }
-            DWORD le = GetLastError();
-            if (le == ERROR_MORE_DATA && got > 0) {
-                total += got;
-                if (total == len) return true;
-                continue;
-            }
-            return false;
-        }
-        return true;
     }
 
     struct SrwExclusive {
@@ -305,26 +282,15 @@ namespace pipetap::inject {
         const uint32_t image_len = meta.image_len;
         const uint32_t payload_len = sample;
 
-        const uint32_t value_len = meta_len + name_len + api_len + image_len + payload_len;
-        PT_TlvHeader hdr{ tlv_type, value_len };
+        std::vector<::pipetap::TlvFragment> fragments;
+        fragments.reserve(1 + (name_len ? 1 : 0) + (api_len ? 1 : 0) + (image_len ? 1 : 0) + ((payload_len && buf) ? 1 : 0));
+        fragments.push_back({ &meta, meta_len });
+        if (name_len) fragments.push_back({ pipeName.data(), name_len });
+        if (api_len) fragments.push_back({ api.data(), api_len });
+        if (image_len) fragments.push_back({ peerImg.data(), image_len });
+        if (payload_len && buf) fragments.push_back({ buf, payload_len });
 
-        // Serialize
-        std::vector<uint8_t> msg;
-        msg.reserve(sizeof(hdr) + value_len);
-
-        msg.insert(msg.end(),
-            reinterpret_cast<const uint8_t*>(&hdr),
-            reinterpret_cast<const uint8_t*>(&hdr) + sizeof(hdr));
-
-        msg.insert(msg.end(),
-            reinterpret_cast<const uint8_t*>(&meta),
-            reinterpret_cast<const uint8_t*>(&meta) + meta_len);
-
-        if (name_len) msg.insert(msg.end(), pipeName.begin(), pipeName.end());
-        if (api_len)  msg.insert(msg.end(), api.begin(), api.end());
-        if (image_len) msg.insert(msg.end(), peerImg.begin(), peerImg.end());
-        if (payload_len && buf)
-            msg.insert(msg.end(), (const uint8_t*)buf, (const uint8_t*)buf + payload_len);
+        auto msg = ::pipetap::BuildTlvMessage(tlv_type, fragments);
 
         AcquireSRWLockExclusive(&ctrl_lock_);
         {
@@ -500,13 +466,10 @@ namespace pipetap::inject {
             return;
         }
 
-        PT_TlvHeader hdr{ type, meta_len + payload_len };
-
-        std::vector<uint8_t> msg(sizeof(hdr) + meta_len + payload_len);
-        std::memcpy(msg.data(), &hdr, sizeof(hdr));
-        if (meta_len && meta)     std::memcpy(msg.data() + sizeof(hdr), meta, meta_len);
-        if (payload_len && payload)
-            std::memcpy(msg.data() + sizeof(hdr) + meta_len, payload, payload_len);
+        std::vector<::pipetap::TlvFragment> fragments;
+        if (meta_len && meta) fragments.push_back({ meta, meta_len });
+        if (payload_len && payload) fragments.push_back({ payload, payload_len });
+        auto msg = ::pipetap::BuildTlvMessage(type, fragments);
 
         AcquireSRWLockExclusive(&ctrl_lock_);
         {
@@ -536,13 +499,17 @@ namespace pipetap::inject {
             if (totalAvail < sizeof(PT_TlvHeader)) { Sleep(1); continue; }
 
             PT_TlvHeader hdr{};
-            if (!read_exact_msg(h, &hdr, (DWORD)sizeof(hdr))) break;
+            {
+                SuppressHooksGuard _guard;
+                if (!::pipetap::PipeReadExact(h, &hdr, static_cast<DWORD>(sizeof(hdr)))) break;
+            }
 
             if (hdr.length > (512u * 1024u * 1024u)) break;
 
             std::vector<uint8_t> val(hdr.length);
             if (hdr.length) {
-                if (!read_exact_msg(h, val.data(), hdr.length)) break;
+                SuppressHooksGuard _guard;
+                if (!::pipetap::PipeReadExact(h, val.data(), hdr.length)) break;
             }
 
             ctrl_broken_.store(false, std::memory_order_release);

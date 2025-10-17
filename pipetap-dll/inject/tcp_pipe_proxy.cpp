@@ -9,6 +9,7 @@
 #include <vector>
 #include <atomic>
 #include "pipetap/log.h"
+#include "pipetap/winpipe_helpers.h"
 #include "inject/tcp_pipe_proxy.h"
 #include "inject/hook_guards.h"   // SuppressHooksGuard
 #include "inject/pipe_utils.h"    // query_pipe_hints()
@@ -32,30 +33,6 @@ namespace pipetap::inject {
         _snprintf_s(out, _TRUNCATE, "%s:%u", ip, port);
 
         return std::string(out);
-    }
-
-    static bool read_exact_msg_for_proxy(HANDLE h, void* buf, DWORD len) {
-        SuppressHooksGuard _guard;
-        auto* p = static_cast<uint8_t*>(buf);
-        DWORD total = 0;
-
-        while (total < len) {
-            DWORD got = 0;
-            BOOL ok = ReadFile(h, p + total, len - total, &got, nullptr);
-            if (ok) {
-                total += got;
-                if (total == len) return true;
-                continue;
-            }
-            DWORD le = GetLastError();
-            if (le == ERROR_MORE_DATA && got > 0) {
-                total += got;
-                if (total == len) return true;
-                continue;
-            }
-            return false;
-        }
-        return true;
     }
 
     static HANDLE open_named_pipe_best_effort(const std::string& name,
@@ -562,10 +539,13 @@ namespace pipetap::inject {
                 }
                 if (avail == 0) { Sleep(1); continue; }
                 if (buf.size() < avail) buf.resize(avail);
-                if (!read_exact_msg_for_proxy(ctx->hPipe, buf.data(), avail)) {
-                    DWORD le = GetLastError();
-                    log::printf("TcpPipeProxy: pipe->sock: read_exact_msg failed gle=%lu", le);
-                    break;
+                {
+                    SuppressHooksGuard g;
+                    if (!::pipetap::PipeReadExact(ctx->hPipe, buf.data(), avail)) {
+                        DWORD le = GetLastError();
+                        log::printf("TcpPipeProxy: pipe->sock: PipeReadExact failed gle=%lu", le);
+                        break;
+                    }
                 }
                 got = avail;
             }

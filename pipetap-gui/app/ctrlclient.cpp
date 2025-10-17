@@ -4,6 +4,7 @@
 #include "ctrlclient.h"
 #include "log.h"
 #include "session.h"
+#include "pipetap/winpipe_helpers.h"
 #include "win/error.h"
 #include <cstring>
 #include <sstream>
@@ -62,36 +63,16 @@ namespace pipetap::ctrlclient {
         if (cmd_to_cancel != INVALID_HANDLE_VALUE) CloseHandle(cmd_to_cancel);
     }
 
-    bool CtrlClient::ReadExact(HANDLE h, void* buf, DWORD len) {
-        BYTE* p = static_cast<BYTE*>(buf);
-        DWORD got = 0;
-
-        while (got < len) {
-            DWORD chunk = 0;
-            if (!ReadFile(h, p + got, len - got, &chunk, nullptr)) {
-                DWORD le = GetLastError();
-                if (le == ERROR_MORE_DATA) {
-                    if (chunk == 0) return false;
-                    got += chunk;
-                    continue;
-                }
-                return false;
-            }
-
-            if (chunk == 0) return false;
-
-            got += chunk;
-        }
-        return true;
-    }
-
     bool CtrlClient::SendTLV(uint16_t type, const void* v1, uint32_t n1, const void* v2, uint32_t n2) {
 
-        PT_TlvHeader hdr{ type, n1 + n2 };
-        std::vector<uint8_t> msg(sizeof(hdr) + static_cast<size_t>(n1) + static_cast<size_t>(n2));
-        std::memcpy(msg.data(), &hdr, sizeof(hdr));
-        if (n1 && v1) std::memcpy(msg.data() + sizeof(hdr), v1, n1);
-        if (n2 && v2) std::memcpy(msg.data() + sizeof(hdr) + n1, v2, n2);
+        std::vector<::pipetap::TlvFragment> fragments;
+        size_t expected = 0;
+        if (n1 && v1) ++expected;
+        if (n2 && v2) ++expected;
+        fragments.reserve(expected);
+        if (n1 && v1) fragments.push_back({ v1, n1 });
+        if (n2 && v2) fragments.push_back({ v2, n2 });
+        auto msg = ::pipetap::BuildTlvMessage(type, fragments);
 
         HANDLE h = INVALID_HANDLE_VALUE;
         {
@@ -256,7 +237,7 @@ namespace pipetap::ctrlclient {
             }
 
             PT_TlvHeader hdr{};
-            if (!ReadExact(ev_snapshot, &hdr, (DWORD)sizeof(hdr))) {
+            if (!::pipetap::PipeReadExact(ev_snapshot, &hdr, static_cast<DWORD>(sizeof(hdr)))) {
                 const DWORD le = GetLastError();
                 pipetap::log::App.Errorf("CtrlClient::Loop: header read failed -> disconnect le=%lu", (unsigned long)le);
                 this->SetLastError(cur_pid, std::string("Read header failed: ") + FormatLeA(le));
@@ -294,7 +275,7 @@ namespace pipetap::ctrlclient {
             }
 
             std::vector<uint8_t> val(hdr.length);
-            if (hdr.length && !ReadExact(ev_snapshot, val.data(), hdr.length)) {
+            if (hdr.length && !::pipetap::PipeReadExact(ev_snapshot, val.data(), hdr.length)) {
                 const DWORD le = GetLastError();
                 pipetap::log::App.Errorf("CtrlClient::Loop: value read failed -> disconnect le=%lu", (unsigned long)le);
                 this->SetLastError(cur_pid, std::string("Read value failed: ") + FormatLeA(le));
