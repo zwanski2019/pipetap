@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -22,62 +23,57 @@
 
 namespace pipetap::ui::proxy {
 
-    static std::unordered_map<Tab*, std::string>              g_tabTitles;
-    static std::unordered_map<Tab*, int>                      g_tabOrdinals;
-    static std::unordered_map<Tab*, std::array<char, 128>>    g_tabEdit;
-
-    static std::unordered_map<Tab*, bool>   g_connecting;
-    static std::unordered_map<Tab*, double> g_connectStartedAt;
-
-    static std::unordered_map<Tab*, bool> g_req_is_hex, g_resp_is_hex;
-    static std::unordered_map<Tab*, bool> g_req_wide, g_resp_wide;
-    static std::unordered_map<Tab*, bool> g_req_prev_hex, g_resp_prev_hex;
-
-    static std::unordered_map<Tab*, MemoryEditor>          g_req_hex, g_resp_hex;
-    static std::unordered_map<Tab*, std::vector<ImU8>>     g_req_hex_buf, g_resp_hex_buf;
-
     static int g_nextOrdinal = 1;
 
-    static void RegisterTabIfNeeded(Tab* t) {
-        if (!t) return;
+    struct IncomingBuffer {
+        std::mutex mtx;
+        std::vector<pipetap::sharedui::MsgLogEntry> items;
+    };
 
-        if (g_tabOrdinals.find(t) == g_tabOrdinals.end()) {
-            int ord = g_nextOrdinal++;
-            g_tabOrdinals[t] = ord;
-            std::string def = std::string("#") + std::to_string(ord);
-            g_tabTitles[t] = def;
-            auto& buf = g_tabEdit[t];
-            buf.fill(0);
-            std::snprintf(buf.data(), buf.size(), "%s", def.c_str());
-            g_connecting[t] = false;
-            g_connectStartedAt[t] = 0.0;
+    struct ProxySideState {
+        bool is_hex = false;
+        bool prev_hex = false;
+        bool is_wide = false;
+        MemoryEditor editor;
+        std::vector<ImU8> hex_buffer;
 
-            g_req_is_hex[t] = false;  g_resp_is_hex[t] = false;
-            g_req_prev_hex[t] = false;  g_resp_prev_hex[t] = false;
-            g_req_wide[t] = false;  g_resp_wide[t] = false;
-
-            g_req_hex[t] = MemoryEditor(); g_resp_hex[t] = MemoryEditor();
-            g_req_hex[t].ReadOnly = false; g_resp_hex[t].ReadOnly = false;
-            g_req_hex[t].OptShowOptions = true; g_resp_hex[t].OptShowOptions = true;
-
-            g_req_hex_buf[t] = {}; g_resp_hex_buf[t] = {};
+        ProxySideState() {
+            editor.ReadOnly = false;
+            editor.OptShowOptions = true;
         }
+    };
+
+    struct TabState {
+        std::string title;
+        std::array<char, 128> title_edit{};
+        int ordinal = 0;
+        bool connecting = false;
+        double connect_started_at = 0.0;
+        ProxySideState request;
+        ProxySideState response;
+        pipetap::sharedui::FilterCache filters;
+        std::unique_ptr<IncomingBuffer> incoming;
+    };
+
+    static std::unordered_map<Tab*, TabState> g_tabState;
+
+    static TabState& RegisterTabIfNeeded(Tab* t) {
+        IM_ASSERT(t && "RegisterTabIfNeeded called with null Tab*");
+        auto [it, inserted] = g_tabState.try_emplace(t);
+        TabState& state = it->second;
+        if (inserted) {
+            state.ordinal = g_nextOrdinal++;
+            state.title = std::string("#") + std::to_string(state.ordinal);
+            state.title_edit.fill(0);
+            std::snprintf(state.title_edit.data(), state.title_edit.size(), "%s", state.title.c_str());
+            state.incoming = std::make_unique<IncomingBuffer>();
+        }
+        return state;
     }
 
     static void UnregisterTab(Tab* t) {
         if (!t) return;
-
-        g_tabTitles.erase(t);
-        g_tabOrdinals.erase(t);
-        g_tabEdit.erase(t);
-        g_connecting.erase(t);
-        g_connectStartedAt.erase(t);
-
-        g_req_is_hex.erase(t);  g_resp_is_hex.erase(t);
-        g_req_prev_hex.erase(t); g_resp_prev_hex.erase(t);
-        g_req_wide.erase(t);    g_resp_wide.erase(t);
-        g_req_hex.erase(t);     g_resp_hex.erase(t);
-        g_req_hex_buf.erase(t); g_resp_hex_buf.erase(t);
+        g_tabState.erase(t);
     }
 
     static void SendEditReply(ctrlclient::CtrlClient* client, uint64_t op_id, bool replace, const char* bytes, size_t len) {
@@ -92,27 +88,16 @@ namespace pipetap::ui::proxy {
             client->SendTLV(PT_CMD_EDIT_REPLY, &rep, (uint32_t)sizeof(rep));
     }
 
-    static std::unordered_map<Tab*, pipetap::sharedui::FilterCache> g_filterCache;
-
-    struct IncomingBuffer {
-        std::mutex mtx;
-        std::vector<pipetap::sharedui::MsgLogEntry> items;
-    };
-    static std::unordered_map<Tab*, std::unique_ptr<IncomingBuffer>> g_incoming;
-
     static IncomingBuffer* EnsureIncoming(Tab* t) {
-        auto it = g_incoming.find(t);
-        if (it != g_incoming.end()) return it->second.get();
-
-        auto up = std::make_unique<IncomingBuffer>();
-        auto* raw = up.get();
-        g_incoming[t] = std::move(up);
-        return raw;
+        TabState& state = RegisterTabIfNeeded(t);
+        if (!state.incoming) state.incoming = std::make_unique<IncomingBuffer>();
+        return state.incoming.get();
     }
 
     static void DrainIncomingToLog(Tab* t) {
         if (!t) return;
 
+        TabState& state = RegisterTabIfNeeded(t);
         auto* inc = EnsureIncoming(t);
         std::vector<pipetap::sharedui::MsgLogEntry> tmp;
         {
@@ -125,7 +110,7 @@ namespace pipetap::ui::proxy {
             if (!tmp.empty()) t->s.log.reserve(t->s.log.size() + tmp.size());
             for (auto& e : tmp) t->s.log.push_back(std::move(e));
         }
-        g_filterCache[t].dirty = true;
+        state.filters.dirty = true;
     }
 
     static std::vector<uint8_t> BuildBytesForSend(const char* text_utf8, bool is_hex_mode, bool is_wide_utf16,
@@ -176,13 +161,15 @@ namespace pipetap::ui::proxy {
             }
         }
 
-        // Per-tab editor state
-        bool& is_hex = is_req ? g_req_is_hex[&tab] : g_resp_is_hex[&tab];
-        bool& was_hex = is_req ? g_req_prev_hex[&tab] : g_resp_prev_hex[&tab];
-        bool& is_wide = is_req ? g_req_wide[&tab] : g_resp_wide[&tab];
+        TabState& state = RegisterTabIfNeeded(&tab);
+        ProxySideState& side = is_req ? state.request : state.response;
 
-        auto& hex_editor = is_req ? g_req_hex[&tab] : g_resp_hex[&tab];
-        auto& hex_buf = is_req ? g_req_hex_buf[&tab] : g_resp_hex_buf[&tab];
+        bool& is_hex = side.is_hex;
+        bool& was_hex = side.prev_hex;
+        bool& is_wide = side.is_wide;
+
+        auto& hex_editor = side.editor;
+        auto& hex_buf = side.hex_buffer;
 
         // If we just switched into Hex mode, seed the hex buffer from the current text + encoding.
         if (!was_hex && is_hex) {
@@ -409,11 +396,13 @@ namespace pipetap::ui::proxy {
 
         SeparatorText("Traffic Log");
 
+        TabState& state = RegisterTabIfNeeded(&tab);
+
         if (Button("Clear")) {
             std::lock_guard<std::mutex> lk(tab.s.log_mtx);
             tab.s.log.clear();
             tab.s.selected_row = -1;
-            auto& fc = g_filterCache[&tab];
+            auto& fc = state.filters;
             fc.indices.clear();
             fc.last_log_size = 0;
             fc.dirty = true;
@@ -425,7 +414,7 @@ namespace pipetap::ui::proxy {
         SetNextItemWidth(90.f);
         const char* dir_items[] = { "All", "Out (->)", "In (<-)" };
         if (Combo("##dir", &tab.filter_dir, dir_items, IM_ARRAYSIZE(dir_items))) {
-            auto& fc = g_filterCache[&tab];
+            auto& fc = state.filters;
             fc.dir = tab.filter_dir;
             fc.dirty = true;
         }
@@ -434,7 +423,7 @@ namespace pipetap::ui::proxy {
         SetNextItemWidth(260.f);
         bool needle_changed = InputTextWithHint("##flt", "filter", tab.filter_text, IM_ARRAYSIZE(tab.filter_text));
         if (needle_changed) {
-            auto& fc = g_filterCache[&tab];
+            auto& fc = state.filters;
             fc.needle_lower = pipetap::sharedui::ToLowerStr(tab.filter_text);
             fc.dirty = true;
         }
@@ -458,19 +447,9 @@ namespace pipetap::ui::proxy {
 
         std::vector<int>* index_map_ptr = nullptr;
         {
-            auto& fc = g_filterCache[&tab];
-
-            size_t cur_size = 0;
-            {
-                std::lock_guard<std::mutex> lk(tab.s.log_mtx);
-                cur_size = tab.s.log.size();
-            }
-
-            {
-                std::lock_guard<std::mutex> lk(tab.s.log_mtx);
-                pipetap::sharedui::EnsureFilterUpToDate(tab.s.log, fc);
-            }
-
+            auto& fc = state.filters;
+            std::lock_guard<std::mutex> lk(tab.s.log_mtx);
+            pipetap::sharedui::EnsureFilterUpToDate(tab.s.log, fc);
             index_map_ptr = &fc.indices;
         }
 
@@ -508,6 +487,8 @@ namespace pipetap::ui::proxy {
     {
         using namespace ImGui;
 
+        TabState& state = RegisterTabIfNeeded(&tab);
+
         PushID(&tab);
 
         if (is_active_tab && panel_focused) {
@@ -532,8 +513,8 @@ namespace pipetap::ui::proxy {
                 if (Button("Connect")) {
                     if (!tab.client) tab.client = std::make_unique<ctrlclient::CtrlClient>();
                     tab.client->StartForPid(tab.pid, BindHandler(mgr));
-                    g_connecting[&tab] = true;
-                    g_connectStartedAt[&tab] = ImGui::GetTime();
+                    state.connecting = true;
+                    state.connect_started_at = ImGui::GetTime();
                 }
             }
             else {
@@ -542,26 +523,26 @@ namespace pipetap::ui::proxy {
                         tab.client->Stop();
                         tab.client->ClearLastError();
                     }
-                    g_connecting[&tab] = false;
+                    state.connecting = false;
                 }
             }
 
             SameLine();
             if (is_connected) {
-                g_connecting[&tab] = false;
+                state.connecting = false;
                 TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "[connected]");
             }
             else {
                 std::string err = (tab.client ? tab.client->LastErrorForPid(tab.pid) : std::string());
-                if (g_connecting[&tab] && err.empty()) {
-                    float elapsed = (float)(ImGui::GetTime() - g_connectStartedAt[&tab]);
+                if (state.connecting && err.empty()) {
+                    float elapsed = (float)(ImGui::GetTime() - state.connect_started_at);
                     SetNextItemWidth(180.0f);
                     ProgressBar(-(float)ImGui::GetTime(), ImVec2(0, 0), "connecting...");
                     SameLine();
                     TextDisabled("(%.1fs)", elapsed);
                 }
                 else if (!err.empty()) {
-                    g_connecting[&tab] = false;
+                    state.connecting = false;
                     TextColored(ImVec4(0.9f, 0.2f, 0.2f, 1.0f), "[error] %s", err.c_str());
                 }
                 else {
@@ -719,13 +700,13 @@ namespace pipetap::ui::proxy {
     {
         auto tab = std::make_unique<Tab>();
         tab->pid = pid;
-        RegisterTabIfNeeded(tab.get());
+        TabState& state = RegisterTabIfNeeded(tab.get());
 
         tab->client = std::make_unique<ctrlclient::CtrlClient>();
         tab->client->StartForPid(tab->pid, BindHandler(m));
 
-        g_connecting[tab.get()] = true;
-        g_connectStartedAt[tab.get()] = ImGui::GetTime();
+        state.connecting = true;
+        state.connect_started_at = ImGui::GetTime();
 
         m.tabs.push_back(std::move(tab));
         m.active = static_cast<int>(m.tabs.size()) - 1;
@@ -773,9 +754,9 @@ namespace pipetap::ui::proxy {
 
             for (int i = 0; i < (int)m.tabs.size(); ) {
                 Tab& t = *m.tabs[i];
-                RegisterTabIfNeeded(&t);
+                TabState& state = RegisterTabIfNeeded(&t);
 
-                const std::string& visible = g_tabTitles[&t];
+                const std::string& visible = state.title;
 
                 char unique_id[64];
                 std::snprintf(unique_id, sizeof(unique_id), "tab_%p", (void*)&t);
@@ -800,25 +781,23 @@ namespace pipetap::ui::proxy {
                 if (color_pushed) ImGui::PopStyleColor(color_pushed);
 
                 if (ImGui::BeginPopupContextItem()) {
-                    auto& buf = g_tabEdit[&t];
+                    auto& buf = state.title_edit;
                     ImGui::TextUnformatted("Rename Tab");
                     ImGui::Separator();
                     ImGui::InputText("Name", buf.data(), buf.size());
                     if (ImGui::Button("Apply")) {
                         std::string new_name = buf.data();
                         if (new_name.empty()) {
-                            int ord = g_tabOrdinals[&t];
-                            new_name = std::string("#") + std::to_string(ord);
+                            new_name = std::string("#") + std::to_string(state.ordinal);
                             std::snprintf(buf.data(), buf.size(), "%s", new_name.c_str());
                         }
-                        g_tabTitles[&t] = new_name;
+                        state.title = new_name;
                         ImGui::CloseCurrentPopup();
                     }
                     ImGui::SameLine();
                     if (ImGui::Button("Reset")) {
-                        int ord = g_tabOrdinals[&t];
-                        std::string def = std::string("#") + std::to_string(ord);
-                        g_tabTitles[&t] = def;
+                        std::string def = std::string("#") + std::to_string(state.ordinal);
+                        state.title = def;
                         std::snprintf(buf.data(), buf.size(), "%s", def.c_str());
                         ImGui::CloseCurrentPopup();
                     }
