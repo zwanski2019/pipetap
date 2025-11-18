@@ -109,60 +109,47 @@ namespace pipetap::ui::replay {
         return ImGui::GetFrameHeight() + 6.0f;
     }
 
-    // Per-tab titles and state
-    static std::unordered_map<Tab*, std::string>              g_tabTitles;
-    static std::unordered_map<Tab*, int>                      g_tabOrdinals;
-    static std::unordered_map<Tab*, std::array<char, 128>>    g_tabEdit;
-
-    // Per-tab layout (editors block height + request:response split)
-    static std::unordered_map<Tab*, float>                    g_edit_h;
-    static std::unordered_map<Tab*, float>                    g_edit_split_ratio;
-
-    // Response view per-tab state
-    static std::unordered_map<Tab*, bool>                     g_rx_is_hex;
-    static std::unordered_map<Tab*, MemoryEditor>             g_rx_hex;
-
-    // Per-tab event logs (status feed)
-    static std::unordered_map<Tab*, std::vector<pipetap::log::Event>> g_statusCache;
-
     static int g_nextOrdinal = 1;
 
-    static void RegisterTabIfNeeded(Tab* t) {
-        if (!t) return;
-        if (g_tabOrdinals.find(t) == g_tabOrdinals.end()) {
-            int ord = g_nextOrdinal++;
-            g_tabOrdinals[t] = ord;
-            std::string def = std::string("#") + std::to_string(ord);
-            g_tabTitles[t] = def;
-            auto& buf = g_tabEdit[t];
-            buf.fill(0);
-            std::snprintf(buf.data(), buf.size(), "%s", def.c_str());
+    struct ReplayTabState {
+        std::string title;
+        std::array<char, 128> title_edit{};
+        int ordinal = 0;
 
-            g_edit_h[t] = 240.0f;
-            g_edit_split_ratio[t] = 0.5f;
+        float editor_height = 240.0f;
+        float editor_split_ratio = 0.5f;
 
-            g_rx_is_hex[t] = false;
-            g_rx_hex[t] = MemoryEditor();
-            g_rx_hex[t].ReadOnly = true;
-            g_rx_hex[t].OptShowOptions = true;
+        bool rx_is_hex = false;
+        MemoryEditor rx_hex;
 
-            t->s.status_channel = std::string("replay/status/") + def;
+        std::vector<pipetap::log::Event> status_cache;
+        pipetap::sharedui::FilterCache traffic_filter;
+    };
+
+    static std::unordered_map<Tab*, ReplayTabState> g_tabState;
+
+    static ReplayTabState& RegisterTabIfNeeded(Tab* t) {
+        IM_ASSERT(t && "RegisterTabIfNeeded called with null Tab*");
+        auto [it, inserted] = g_tabState.try_emplace(t);
+        ReplayTabState& state = it->second;
+        if (inserted) {
+            state.ordinal = g_nextOrdinal++;
+            state.title = std::string("#") + std::to_string(state.ordinal);
+            state.title_edit.fill(0);
+            std::snprintf(state.title_edit.data(), state.title_edit.size(), "%s", state.title.c_str());
+
+            state.rx_hex.ReadOnly = true;
+            state.rx_hex.OptShowOptions = true;
+
+            t->s.status_channel = std::string("replay/status/") + state.title;
         }
+        return state;
     }
 
     static void UnregisterTab(Tab* t) {
         if (!t) return;
-        g_tabTitles.erase(t);
-        g_tabOrdinals.erase(t);
-        g_tabEdit.erase(t);
-        g_edit_h.erase(t);
-        g_edit_split_ratio.erase(t);
-        g_rx_is_hex.erase(t);
-        g_rx_hex.erase(t);
-        g_statusCache.erase(t);
+        g_tabState.erase(t);
     }
-
-    static std::unordered_map<Tab*, pipetap::sharedui::FilterCache> g_filterCache;
 
     static void DrawControlChannel(State& s)
     {
@@ -285,8 +272,10 @@ namespace pipetap::ui::replay {
         const float hsplit_thick = 6.0f;
         const float min_side_w = 120.0f;
 
-        float& editors_h = g_edit_h[&tab];
-        float& ratio = g_edit_split_ratio[&tab];
+        ReplayTabState& state = RegisterTabIfNeeded(&tab);
+
+        float& editors_h = state.editor_height;
+        float& ratio = state.editor_split_ratio;
         editors_h = std::max(140.0f, editors_h);
         ratio = std::clamp(ratio, 0.1f, 0.9f);
 
@@ -566,7 +555,7 @@ namespace pipetap::ui::replay {
         SameLine();
         TextDisabled("| Mode:");
         SameLine();
-        bool& rx_is_hex = g_rx_is_hex[&tab];
+        bool& rx_is_hex = state.rx_is_hex;
         (void)pipetap::sharedui::SegmentedToggle("resp_mode", "Text", "Hex", rx_is_hex);
 
         SameLine();
@@ -602,7 +591,7 @@ namespace pipetap::ui::replay {
                     ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_NoHorizontalScroll);
             }
             else {
-                auto& hex = g_rx_hex[&tab];
+                auto& hex = state.rx_hex;
                 std::vector<uint8_t> bytes(s.rx_text.begin(), s.rx_text.end());
                 void* memptr = bytes.empty() ? nullptr : (void*)bytes.data();
                 size_t memsz = bytes.size();
@@ -696,10 +685,11 @@ namespace pipetap::ui::replay {
 
         SeparatorText("Traffic Log");
 
+        ReplayTabState& state = RegisterTabIfNeeded(&t);
         if (Button("Clear")) {
             t.s.log.clear();
             t.s.selected_row = -1;
-            auto& fc = g_filterCache[&t];
+            auto& fc = state.traffic_filter;
             fc.indices.clear();
             fc.last_log_size = 0;
             fc.dirty = true;
@@ -711,7 +701,7 @@ namespace pipetap::ui::replay {
         SetNextItemWidth(90.f);
         const char* dir_items[] = { "All", "Out (->)", "In (<-)" };
         if (Combo("##dir", &t.s.filter_dir, dir_items, IM_ARRAYSIZE(dir_items))) {
-            auto& fc = g_filterCache[&t];
+            auto& fc = state.traffic_filter;
             fc.dir = t.s.filter_dir;
             fc.dirty = true;
         }
@@ -720,7 +710,7 @@ namespace pipetap::ui::replay {
         SetNextItemWidth(260.f);
         bool needle_changed = InputTextWithHint("##flt", "filter", t.s.filter_text, IM_ARRAYSIZE(t.s.filter_text));
         if (needle_changed) {
-            auto& fc = g_filterCache[&t];
+            auto& fc = state.traffic_filter;
             fc.needle_lower = pipetap::sharedui::ToLowerStr(t.s.filter_text);
             fc.dirty = true;
         }
@@ -742,7 +732,7 @@ namespace pipetap::ui::replay {
         // Build/update filtered indices (index-only)
         std::vector<int>* index_map_ptr = nullptr;
         {
-            auto& fc = g_filterCache[&t];
+            auto& fc = state.traffic_filter;
             size_t cur_size = t.s.log.size();
             if (fc.dirty || fc.last_log_size != cur_size) {
                 pipetap::sharedui::RebuildFilterIndices(t.s.log, fc);
@@ -781,13 +771,14 @@ namespace pipetap::ui::replay {
     // Status bar that drains the per-tab channel and keeps a small UI cache
     static void DrawStatusBar(Tab& tab) {
         State& s = tab.s;
+        ReplayTabState& state = RegisterTabIfNeeded(&tab);
 
         // Non-blocking drain from the channel into our per-tab cache
         auto& ch = pipetap::log::channel(s.status_channel);
         std::vector<pipetap::log::Event> tmp;
         (void)ch.Drain(tmp); // non-blocking (returns false if busy; we just skip this frame)
         if (!tmp.empty()) {
-            auto& cache = g_statusCache[&tab];
+            auto& cache = state.status_cache;
             const size_t cap = 2000;
             if (cache.size() + tmp.size() > cap) {
                 size_t over = cache.size() + tmp.size() - cap;
@@ -817,7 +808,7 @@ namespace pipetap::ui::replay {
             return ImVec4(0.80f, 0.80f, 0.80f, 1.0f);
             };
 
-        auto& cache = g_statusCache[&tab];
+        auto& cache = state.status_cache;
 
         if (!s.status_expanded) {
             ImGui::AlignTextToFramePadding();
@@ -934,6 +925,7 @@ namespace pipetap::ui::replay {
     static void DrawOneTab(Tab& t, bool is_active_panel)
     {
         static uint64_t nextId = 1;
+        ReplayTabState& state = RegisterTabIfNeeded(&t);
 
         if (is_active_panel) t.has_unseen = false;
 
@@ -945,7 +937,7 @@ namespace pipetap::ui::replay {
 
         // Splitter between editors and traffic (adjust editors height vs remaining)
         {
-            float& editors_h = g_edit_h[&t];
+            float& editors_h = state.editor_height;
             if (editors_h < 140.0f) editors_h = 140.0f;
             float rest = ImGui::GetContentRegionAvail().y;
             float dummy_log_h = rest - 6.0f;
@@ -976,40 +968,36 @@ namespace pipetap::ui::replay {
 
             for (int i = 0; i < (int)m.tabs.size();) {
                 Tab& t = *m.tabs[i];
-                RegisterTabIfNeeded(&t);
-
-                const std::string& visible = g_tabTitles[&t];
+                ReplayTabState& state = RegisterTabIfNeeded(&t);
 
                 char unique_id[64];
                 std::snprintf(unique_id, sizeof(unique_id), "replay_tab_%p", (void*)&t);
 
                 char label[256];
-                std::snprintf(label, sizeof(label), "%s##%s", visible.c_str(), unique_id);
+                std::snprintf(label, sizeof(label), "%s##%s", state.title.c_str(), unique_id);
 
                 bool open = true;
                 bool began = ImGui::BeginTabItem(label, (m.tabs.size() > 1) ? &open : nullptr);
 
                 // Right-click context menu for rename (manual; NOT tied to typing)
                 if (ImGui::BeginPopupContextItem()) {
-                    auto& buf = g_tabEdit[&t];
+                    auto& buf = state.title_edit;
                     ImGui::TextUnformatted("Rename Tab");
                     ImGui::Separator();
                     ImGui::InputText("Name", buf.data(), buf.size());
                     if (ImGui::Button("Apply")) {
                         std::string new_name = buf.data();
                         if (new_name.empty()) {
-                            int ord = g_tabOrdinals[&t];
-                            new_name = std::string("#") + std::to_string(ord);
+                            new_name = std::string("#") + std::to_string(state.ordinal);
                             std::snprintf(buf.data(), buf.size(), "%s", new_name.c_str());
                         }
-                        g_tabTitles[&t] = new_name;
+                        state.title = new_name;
                         ImGui::CloseCurrentPopup();
                     }
                     ImGui::SameLine();
                     if (ImGui::Button("Reset")) {
-                        int ord = g_tabOrdinals[&t];
-                        std::string def = std::string("#") + std::to_string(ord);
-                        g_tabTitles[&t] = def;
+                        std::string def = std::string("#") + std::to_string(state.ordinal);
+                        state.title = def;
                         std::snprintf(buf.data(), buf.size(), "%s", def.c_str());
                         ImGui::CloseCurrentPopup();
                     }
