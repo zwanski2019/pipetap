@@ -442,7 +442,7 @@ namespace pipetap::ui::pipelist {
                     float row_h = ImGui::GetTextLineHeightWithSpacing();
                     ImGui::Selectable("##rowctx",
                         false,
-                        ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap,
+                        ImGuiSelectableFlags_SpanAllColumns,
                         ImVec2(0, row_h));
 
                     if (ImGui::BeginPopupContextItem("##row_popup")) {
