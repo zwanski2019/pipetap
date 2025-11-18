@@ -12,7 +12,7 @@ We are building a Windows named pipe debug proxy in C++, using a test client and
 
 ### General Agent Rules
 
-When suggesting UI code, stick to the ImGui public api, and dont use the imgui_internal.h header directly. We are using ImGui 1.92.3. ImGui can be found here: <https://github.com/ocornut/imgui>.
+When suggesting UI code, stick to the ImGui public api, and dont use the imgui_internal.h header directly. We are using ImGui 1.92.4. ImGui can be found here: <https://github.com/ocornut/imgui>.
 Don't use any emojis in source code. Changes never have to be backwards compatible for any of the components. The final compiled artefact includes everything needed to function properly.
 
 When proposing code, try and keep it as simple as possible. That is, whenever possible suggest changes that would be the most maintainable in the long term. Avoid small hacks as workarounds. Instead, suggest larger changes when needed. Keep the code DRY, avoiding duplicated code. If something should be refactored into a helper, do it.
