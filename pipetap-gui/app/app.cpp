@@ -169,48 +169,36 @@ namespace pipetap {
 
                 ImGui::DockSpace(dockspace_id, dock_sz, dock_flags);
 
-                // proxy
-                if (show_proxy) {
-                    ImGui::SetNextWindowDockID(dockspace_id, ImGuiCond_Appearing);
-                    if (ImGui::Begin("Proxy", &show_proxy, child_flags)) { ui::proxy::Draw(proxy); }
-                    ImGui::End();
-                }
+                struct PanelDef {
+                    const char* name;
+                    bool* visible;
+                    ImGuiWindowFlags flags;
+                    std::function<void()> draw;
+                };
 
-                // replay
-                if (show_replay) {
-                    ImGui::SetNextWindowDockID(dockspace_id, ImGuiCond_Appearing);
-                    if (ImGui::Begin("Replay", &show_replay, child_flags)) { ui::replay::Draw(replay); }
-                    ImGui::End();
-                }
+                static pipetap::sharedui::LogDrainState app_log_state;
 
-                // injector
-                if (show_injector) {
-                    ImGui::SetNextWindowDockID(dockspace_id, ImGuiCond_Appearing);
-                    if (ImGui::Begin("Injector", &show_injector)) { ui::injector::Draw(inj); }
-                    ImGui::End();
-                }
-
-                // pipelist
-                if (show_pipelist) {
-                    ImGui::SetNextWindowDockID(dockspace_id, ImGuiCond_Appearing);
-                    if (ImGui::Begin("Pipelist", &show_pipelist)) { ui::pipelist::Draw(pipelist); }
-                    ImGui::End();
-                }
-
-                // application Log
-                if (show_app_log) {
-                    ImGui::SetNextWindowDockID(dockspace_id, ImGuiCond_Appearing);
-                    if (ImGui::Begin("Application Log", &show_app_log)) {
-                        static pipetap::sharedui::LogDrainState app_log_state;
-
+                PanelDef panels[] = {
+                    { "Proxy", &show_proxy, child_flags, [&]() { ui::proxy::Draw(proxy); } },
+                    { "Replay", &show_replay, child_flags, [&]() { ui::replay::Draw(replay); } },
+                    { "Injector", &show_injector, 0, [&]() { ui::injector::Draw(inj); } },
+                    { "Pipelist", &show_pipelist, child_flags, [&]() { ui::pipelist::Draw(pipelist); } },
+                    { "Application Log", &show_app_log, 0, [&]() {
                         const float h = ImGui::GetContentRegionAvail().y;
                         pipetap::sharedui::DrawLogDrainFeed("##app_log_feed", app_log_state, pipetap::log::App,
                             /*cap=*/4000,
                             /*height=*/h,
                             /*show_clear=*/true,
                             /*auto_scroll=*/true,
-                            /*heading=*/"Application"
-                        );
+                            /*heading=*/"Application");
+                    } },
+                };
+
+                for (auto& panel : panels) {
+                    if (!panel.visible || !(*panel.visible)) continue;
+                    ImGui::SetNextWindowDockID(dockspace_id, ImGuiCond_Appearing);
+                    if (ImGui::Begin(panel.name, panel.visible, panel.flags)) {
+                        panel.draw();
                     }
                     ImGui::End();
                 }
