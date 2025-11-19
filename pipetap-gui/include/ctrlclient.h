@@ -47,6 +47,7 @@ namespace pipetap::ctrlclient {
         }
 
     private:
+        void StartInternal(DWORD pid, bool pin_pid, CtrlMsgCallback cb);
         void Loop();
         std::thread        reader_;
         std::atomic_bool   run_{ false };
@@ -71,6 +72,8 @@ namespace pipetap::ctrlclient {
             SetLastErrorUnlocked(pid, msg);
         }
         void DisconnectHandles(bool cancel_io);
+        bool ConnectToPipes(DWORD cur_pid, const char* display);
+        bool ReadNextMessage(DWORD cur_pid, PT_TlvHeader& hdr, std::vector<uint8_t>& val);
     };
 
     CtrlClient& Control();

@@ -16,20 +16,20 @@ namespace pipetap::ctrlclient {
 
     using pipetap::win::FormatLeA;
 
-    void CtrlClient::Start(CtrlMsgCallback cb) {
+    void CtrlClient::StartInternal(DWORD pid, bool pin_pid, CtrlMsgCallback cb) {
         Stop();
-        fixed_pid_.store(0, std::memory_order_release);
+        fixed_pid_.store(pin_pid ? pid : 0, std::memory_order_release);
         { std::lock_guard<std::mutex> lk(cb_mx_); cb_ = std::move(cb); }
         run_.store(true, std::memory_order_release);
         reader_ = std::thread([this]() { this->Loop(); });
     }
 
+    void CtrlClient::Start(CtrlMsgCallback cb) {
+        StartInternal(0, false, std::move(cb));
+    }
+
     void CtrlClient::StartForPid(DWORD pid, CtrlMsgCallback cb) {
-        Stop();
-        fixed_pid_.store(pid, std::memory_order_release);
-        { std::lock_guard<std::mutex> lk(cb_mx_); cb_ = std::move(cb); }
-        run_.store(true, std::memory_order_release);
-        reader_ = std::thread([this]() { this->Loop(); });
+        StartInternal(pid, true, std::move(cb));
     }
 
     void CtrlClient::Stop() {
@@ -38,17 +38,7 @@ namespace pipetap::ctrlclient {
         // prevent late UI calls
         { std::lock_guard<std::mutex> lk(cb_mx_); cb_ = nullptr; }
 
-        HANDLE ev_to_cancel = INVALID_HANDLE_VALUE;
-        HANDLE cmd_to_cancel = INVALID_HANDLE_VALUE;
-        {
-            std::lock_guard<std::mutex> lk(wr_mtx_);
-            ev_to_cancel = h_ev_;  h_ev_ = INVALID_HANDLE_VALUE;
-            cmd_to_cancel = h_cmd_; h_cmd_ = INVALID_HANDLE_VALUE;
-            connected.store(false, std::memory_order_release);
-        }
-
-        if (ev_to_cancel != INVALID_HANDLE_VALUE) CancelIoEx(ev_to_cancel, nullptr);
-        if (cmd_to_cancel != INVALID_HANDLE_VALUE) CancelIoEx(cmd_to_cancel, nullptr);
+        DisconnectHandles(true);
 
         if (reader_.joinable()) {
             HANDLE th = (HANDLE)reader_.native_handle();
@@ -58,9 +48,6 @@ namespace pipetap::ctrlclient {
         if (reader_.joinable()) {
             reader_.join();
         }
-
-        if (ev_to_cancel != INVALID_HANDLE_VALUE) CloseHandle(ev_to_cancel);
-        if (cmd_to_cancel != INVALID_HANDLE_VALUE) CloseHandle(cmd_to_cancel);
     }
 
     void CtrlClient::DisconnectHandles(bool cancel_io)
@@ -124,6 +111,106 @@ namespace pipetap::ctrlclient {
         return true;
     }
 
+    bool CtrlClient::ConnectToPipes(DWORD cur_pid, const char* display)
+    {
+        std::string ev_path = MakeEventsPipeForPid(cur_pid);
+        std::string cmd_path = MakeCommandsPipeForPid(cur_pid);
+        pipetap::log::App.Infof("CtrlClient::Loop: connecting events=%s  commands=%s  (ui:%s)",
+            ev_path.c_str(), cmd_path.c_str(), display);
+
+        for (int i = 0; i < 60 && run_.load(std::memory_order_acquire); ++i) {
+            BOOL ev_ready = WaitNamedPipeA(ev_path.c_str(), 250);
+            BOOL cmd_ready = WaitNamedPipeA(cmd_path.c_str(), 250);
+            if (ev_ready && cmd_ready) break;
+            Sleep(50);
+        }
+        if (!run_.load(std::memory_order_acquire)) return false;
+
+        HANDLE h_ev = CreateFileA(ev_path.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h_ev == INVALID_HANDLE_VALUE) {
+            const DWORD le = GetLastError();
+            pipetap::log::App.Errorf("CtrlClient::Loop: CreateFileA(events) failed le=%lu", (unsigned long)le);
+            this->SetLastError(cur_pid, std::string("Open events pipe failed: ") + FormatLeA(le));
+            Sleep(250);
+            return false;
+        }
+
+        HANDLE h_cmd = CreateFileA(cmd_path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h_cmd == INVALID_HANDLE_VALUE) {
+            const DWORD le = GetLastError();
+            pipetap::log::App.Errorf("CtrlClient::Loop: CreateFileA(commands) failed le=%lu", (unsigned long)le);
+            this->SetLastError(cur_pid, std::string("Open commands pipe failed: ") + FormatLeA(le));
+            CloseHandle(h_ev);
+            Sleep(250);
+            return false;
+        }
+
+        DWORD mode = PIPE_READMODE_BYTE;
+        SetNamedPipeHandleState(h_ev, &mode, nullptr, nullptr);
+
+        if (!run_.load(std::memory_order_acquire)) {
+            CloseHandle(h_ev);
+            CloseHandle(h_cmd);
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(wr_mtx_);
+            if (h_ev_ != INVALID_HANDLE_VALUE) CloseHandle(h_ev_);
+            if (h_cmd_ != INVALID_HANDLE_VALUE) CloseHandle(h_cmd_);
+            h_ev_ = h_ev;
+            h_cmd_ = h_cmd;
+            connected.store(true, std::memory_order_release);
+        }
+
+        this->ClearLastError();
+        pipetap::log::App.Info((std::string("[control] connected to ") + ev_path + " / " + cmd_path).c_str());
+        pipetap::log::App.Info("CtrlClient::Loop: connected");
+        return true;
+    }
+
+    bool CtrlClient::ReadNextMessage(DWORD cur_pid, PT_TlvHeader& hdr, std::vector<uint8_t>& val)
+    {
+        HANDLE ev_snapshot = INVALID_HANDLE_VALUE;
+        {
+            std::lock_guard<std::mutex> lk(wr_mtx_);
+            ev_snapshot = h_ev_;
+        }
+        if (ev_snapshot == INVALID_HANDLE_VALUE) {
+            connected.store(false, std::memory_order_release);
+            return false;
+        }
+
+        if (!::pipetap::PipeReadExact(ev_snapshot, &hdr, static_cast<DWORD>(sizeof(hdr)))) {
+            const DWORD le = GetLastError();
+            pipetap::log::App.Errorf("CtrlClient::Loop: header read failed -> disconnect le=%lu", (unsigned long)le);
+            this->SetLastError(cur_pid, std::string("Read header failed: ") + FormatLeA(le));
+
+            DisconnectHandles(false);
+            return false;
+        }
+
+        if (hdr.length > (512u * 1024u * 1024u)) {
+            pipetap::log::App.Errorf("CtrlClient::Loop: invalid length %u -> disconnect", (unsigned)hdr.length);
+            this->SetLastError(cur_pid, "Invalid message length from events pipe");
+
+            DisconnectHandles(false);
+            return false;
+        }
+
+        val.resize(hdr.length);
+        if (hdr.length && !::pipetap::PipeReadExact(ev_snapshot, val.data(), hdr.length)) {
+            const DWORD le = GetLastError();
+            pipetap::log::App.Errorf("CtrlClient::Loop: value read failed -> disconnect le=%lu", (unsigned long)le);
+            this->SetLastError(cur_pid, std::string("Read value failed: ") + FormatLeA(le));
+
+            DisconnectHandles(false);
+            return false;
+        }
+
+        return true;
+    }
+
     void CtrlClient::Loop()
     {
         run_.store(true, std::memory_order_release);
@@ -159,98 +246,15 @@ namespace pipetap::ctrlclient {
 
             if (!connected.load(std::memory_order_acquire)) {
                 last_pid = cur_pid;
-
-                std::string ev_path = MakeEventsPipeForPid(cur_pid);
-                std::string cmd_path = MakeCommandsPipeForPid(cur_pid);
-                pipetap::log::App.Infof("CtrlClient::Loop: connecting events=%s  commands=%s  (ui:%s)",
-                    ev_path.c_str(), cmd_path.c_str(), display);
-
-                for (int i = 0; i < 60 && run_.load(std::memory_order_acquire); ++i) {
-                    BOOL ev_ready = WaitNamedPipeA(ev_path.c_str(), 250);
-                    BOOL cmd_ready = WaitNamedPipeA(cmd_path.c_str(), 250);
-                    if (ev_ready && cmd_ready) break;
-                    Sleep(50);
-                }
-                if (!run_.load(std::memory_order_acquire)) break;
-
-                HANDLE h_ev = CreateFileA(ev_path.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-                if (h_ev == INVALID_HANDLE_VALUE) {
-                    const DWORD le = GetLastError();
-                    pipetap::log::App.Errorf("CtrlClient::Loop: CreateFileA(events) failed le=%lu", (unsigned long)le);
-                    this->SetLastError(cur_pid, std::string("Open events pipe failed: ") + FormatLeA(le));
-                    Sleep(250);
+                if (!ConnectToPipes(cur_pid, display)) {
+                    if (!run_.load(std::memory_order_acquire)) break;
                     continue;
                 }
-
-                HANDLE h_cmd = CreateFileA(cmd_path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-                if (h_cmd == INVALID_HANDLE_VALUE) {
-                    const DWORD le = GetLastError();
-                    pipetap::log::App.Errorf("CtrlClient::Loop: CreateFileA(commands) failed le=%lu", (unsigned long)le);
-                    this->SetLastError(cur_pid, std::string("Open commands pipe failed: ") + FormatLeA(le));
-                    CloseHandle(h_ev);
-                    Sleep(250);
-                    continue;
-                }
-
-                DWORD mode = PIPE_READMODE_BYTE;
-                SetNamedPipeHandleState(h_ev, &mode, nullptr, nullptr);
-
-                if (!run_.load(std::memory_order_acquire)) {
-                    CloseHandle(h_ev);
-                    CloseHandle(h_cmd);
-                    break;
-                }
-
-                {
-                    std::lock_guard<std::mutex> lk(wr_mtx_);
-                    // Close any stale members first (defensive)
-                    if (h_ev_ != INVALID_HANDLE_VALUE) CloseHandle(h_ev_);
-                    if (h_cmd_ != INVALID_HANDLE_VALUE) CloseHandle(h_cmd_);
-                    h_ev_ = h_ev;
-                    h_cmd_ = h_cmd;
-                    connected.store(true, std::memory_order_release);
-                }
-
-                this->ClearLastError();
-                pipetap::log::App.Info((std::string("[control] connected to ") + ev_path + " / " + cmd_path).c_str());
-                pipetap::log::App.Info("CtrlClient::Loop: connected");
-            }
-
-            HANDLE ev_snapshot = INVALID_HANDLE_VALUE;
-            {
-                std::lock_guard<std::mutex> lk(wr_mtx_);
-                ev_snapshot = h_ev_;
-            }
-            if (ev_snapshot == INVALID_HANDLE_VALUE) {
-                connected.store(false, std::memory_order_release);
-                continue;
             }
 
             PT_TlvHeader hdr{};
-            if (!::pipetap::PipeReadExact(ev_snapshot, &hdr, static_cast<DWORD>(sizeof(hdr)))) {
-                const DWORD le = GetLastError();
-                pipetap::log::App.Errorf("CtrlClient::Loop: header read failed -> disconnect le=%lu", (unsigned long)le);
-                this->SetLastError(cur_pid, std::string("Read header failed: ") + FormatLeA(le));
-
-                DisconnectHandles(false);
-                continue;
-            }
-
-            if (hdr.length > (512u * 1024u * 1024u)) {
-                pipetap::log::App.Errorf("CtrlClient::Loop: invalid length %u -> disconnect", (unsigned)hdr.length);
-                this->SetLastError(cur_pid, "Invalid message length from events pipe");
-
-                DisconnectHandles(false);
-                continue;
-            }
-
-            std::vector<uint8_t> val(hdr.length);
-            if (hdr.length && !::pipetap::PipeReadExact(ev_snapshot, val.data(), hdr.length)) {
-                const DWORD le = GetLastError();
-                pipetap::log::App.Errorf("CtrlClient::Loop: value read failed -> disconnect le=%lu", (unsigned long)le);
-                this->SetLastError(cur_pid, std::string("Read value failed: ") + FormatLeA(le));
-
-                DisconnectHandles(false);
+            std::vector<uint8_t> val;
+            if (!ReadNextMessage(cur_pid, hdr, val)) {
                 continue;
             }
 
