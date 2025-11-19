@@ -29,11 +29,11 @@ inline std::string MakeCommandsPipeForPid(uint32_t pid) {
 }
 
 // -----------------------------------------------------------------------------
-// TLV basics
+// Control pipe message basics
 // -----------------------------------------------------------------------------
 #pragma pack(push, 1)
 
-struct PT_TlvHeader {
+struct PT_ControlMessageHeader {
     uint16_t type;    // PT_* (see enums below)
     uint32_t length;  // length of VALUE (bytes that follow this header)
 };
@@ -132,7 +132,7 @@ struct PT_EditReply {
 // -----------------------------------------------------------------------------
 
 // Request to open a pipe client from injected process.
-// TLV value layout: [PT_ProxyOpen][pipe_name bytes (utf8, not 0-terminated)]
+// Control message value layout: [PT_ProxyOpen][pipe_name bytes (utf8, not 0-terminated)]
 struct PT_ProxyOpen {
     uint64_t session_id;      // chosen by GUI (unique per session)
     uint32_t timeout_ms;      // WaitNamedPipe / connect timeout
@@ -151,10 +151,10 @@ struct PT_ProxyOpenResult {
 };
 
 // Send data to remote over the opened session (GUI -> DLL)
-// TLV value layout: [PT_ProxySend][data bytes...]
+// Control message value layout: [PT_ProxySend][data bytes...]
 struct PT_ProxySend {
     uint64_t session_id;
-    uint32_t data_size; // number of bytes that follow in the TLV
+    uint32_t data_size; // number of bytes that follow in the control message body
 };
 
 // Close request (GUI -> DLL)
@@ -185,7 +185,7 @@ struct PT_PipeIoView {
 
 template <typename T> static inline T pt_min_(T a, T b) { return (a < b) ? a : b; }
 
-// Parse a PT_PipeIo TLV VALUE buffer into meta + view. Returns true on success.
+// Parse a PT_PipeIo control message VALUE buffer into meta + view. Returns true on success.
 inline bool PT_TryParsePipeIo(const void* value, size_t value_len,
     PT_PipeIo* meta_out, PT_PipeIoView* view_out)
 {
@@ -241,7 +241,7 @@ inline bool PT_TryParsePipeIo(const std::vector<uint8_t>& val,
 }
 
 
-static_assert(sizeof(PT_TlvHeader) == 6, "PT_TlvHeader must be 6 bytes");
+static_assert(sizeof(PT_ControlMessageHeader) == 6, "PT_ControlMessageHeader must be 6 bytes");
 static_assert(sizeof(PT_Hello) == 68, "PT_Hello must be 68 bytes");
 static_assert(sizeof(PT_PipeIo) == 48, "PT_PipeIo must be 48 bytes");
 static_assert(sizeof(PT_Error) == 84, "PT_Error must be 84 bytes");

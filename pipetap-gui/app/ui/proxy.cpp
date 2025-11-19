@@ -210,9 +210,9 @@ namespace pipetap::ui::proxy {
         rep.action = replace ? 1 : 0;
         rep.new_size = replace ? (uint32_t)len : 0;
         if (replace && bytes && len)
-            client->SendTLV(PT_CMD_EDIT_REPLY, &rep, (uint32_t)sizeof(rep), bytes, (uint32_t)len);
+            client->SendControlMessage(PT_CMD_EDIT_REPLY, &rep, (uint32_t)sizeof(rep), bytes, (uint32_t)len);
         else
-            client->SendTLV(PT_CMD_EDIT_REPLY, &rep, (uint32_t)sizeof(rep));
+            client->SendControlMessage(PT_CMD_EDIT_REPLY, &rep, (uint32_t)sizeof(rep));
     }
 
     static IncomingBuffer* EnsureIncoming(Tab* t) {
@@ -880,7 +880,7 @@ namespace pipetap::ui::proxy {
         }
     }
 
-    static void OnCtrlMsgWithManager(Manager& mgr, const PT_TlvHeader& hdr, const std::vector<uint8_t>& val)
+    static void OnCtrlMsgWithManager(Manager& mgr, const PT_ControlMessageHeader& hdr, const std::vector<uint8_t>& val)
     {
         if (hdr.type == PT_HELLO && val.size() >= sizeof(PT_Hello)) {
             PT_Hello hello{}; std::memcpy(&hello, val.data(), sizeof(hello));
@@ -899,7 +899,7 @@ namespace pipetap::ui::proxy {
             return;
         }
 
-        // Accept both IO and EVENT TLVs here
+        // Accept both IO and EVENT control messages here
         const bool is_pipeio_or_event =
             (hdr.type == PT_PIPE_WRITE || hdr.type == PT_PIPE_READ ||
                 hdr.type == PT_TNP_REQUEST || hdr.type == PT_TNP_RESPONSE ||
@@ -1016,12 +1016,12 @@ namespace pipetap::ui::proxy {
             return;
         }
 
-        // finally, log unrecognized TLVs
-        pipetap::log::App.Info("[control] unrecognized TLV or short frame");
+        // finally, log unrecognized control messages
+        pipetap::log::App.Info("[control] unrecognized control message or short frame");
     }
 
     BoundCtrlHandler BindHandler(Manager& m) {
-        return [&m](const PT_TlvHeader& hdr, const std::vector<uint8_t>& val) {
+        return [&m](const PT_ControlMessageHeader& hdr, const std::vector<uint8_t>& val) {
             OnCtrlMsgWithManager(m, hdr, val);
             };
     }

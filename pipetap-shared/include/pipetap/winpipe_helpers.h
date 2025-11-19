@@ -11,26 +11,26 @@
 
 namespace pipetap {
 
-    struct TlvFragment {
+    struct ControlMessageFragment {
         const void* data = nullptr;
         uint32_t length = 0;
     };
 
-    inline std::vector<uint8_t> BuildTlvMessage(uint16_t type,
-        const TlvFragment* fragments, size_t count)
+    inline std::vector<uint8_t> BuildControlMessage(uint16_t type,
+        const ControlMessageFragment* fragments, size_t count)
     {
         uint32_t total_len = 0;
         for (size_t i = 0; i < count; ++i) {
             total_len += fragments[i].length;
         }
 
-        PT_TlvHeader hdr{ type, total_len };
+        PT_ControlMessageHeader hdr{ type, total_len };
         std::vector<uint8_t> msg(sizeof(hdr) + total_len);
         std::memcpy(msg.data(), &hdr, sizeof(hdr));
 
         size_t offset = sizeof(hdr);
         for (size_t i = 0; i < count; ++i) {
-            const TlvFragment& frag = fragments[i];
+            const ControlMessageFragment& frag = fragments[i];
             if (frag.length && frag.data) {
                 std::memcpy(msg.data() + offset, frag.data, frag.length);
             }
@@ -39,16 +39,16 @@ namespace pipetap {
         return msg;
     }
 
-    inline std::vector<uint8_t> BuildTlvMessage(uint16_t type,
-        std::initializer_list<TlvFragment> fragments)
+    inline std::vector<uint8_t> BuildControlMessage(uint16_t type,
+        std::initializer_list<ControlMessageFragment> fragments)
     {
-        return BuildTlvMessage(type, fragments.begin(), fragments.size());
+        return BuildControlMessage(type, fragments.begin(), fragments.size());
     }
 
-    inline std::vector<uint8_t> BuildTlvMessage(uint16_t type,
-        const std::vector<TlvFragment>& fragments)
+    inline std::vector<uint8_t> BuildControlMessage(uint16_t type,
+        const std::vector<ControlMessageFragment>& fragments)
     {
-        return BuildTlvMessage(type, fragments.data(), fragments.size());
+        return BuildControlMessage(type, fragments.data(), fragments.size());
     }
 
     inline bool PipeReadExact(HANDLE h, void* buf, DWORD len)

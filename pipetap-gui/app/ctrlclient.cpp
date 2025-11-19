@@ -70,32 +70,32 @@ namespace pipetap::ctrlclient {
         if (ev_to_close != INVALID_HANDLE_VALUE) CloseHandle(ev_to_close);
     }
 
-    bool CtrlClient::SendTLV(uint16_t type, const void* v1, uint32_t n1, const void* v2, uint32_t n2) {
+    bool CtrlClient::SendControlMessage(uint16_t type, const void* v1, uint32_t n1, const void* v2, uint32_t n2) {
 
-        std::vector<::pipetap::TlvFragment> fragments;
+        std::vector<::pipetap::ControlMessageFragment> fragments;
         size_t expected = 0;
         if (n1 && v1) ++expected;
         if (n2 && v2) ++expected;
         fragments.reserve(expected);
         if (n1 && v1) fragments.push_back({ v1, n1 });
         if (n2 && v2) fragments.push_back({ v2, n2 });
-        auto msg = ::pipetap::BuildTlvMessage(type, fragments);
+        auto msg = ::pipetap::BuildControlMessage(type, fragments);
 
         HANDLE h = INVALID_HANDLE_VALUE;
         {
             std::lock_guard<std::mutex> lk(wr_mtx_);
             if (!connected.load(std::memory_order_acquire) || h_cmd_ == INVALID_HANDLE_VALUE) {
-                pipetap::log::App.Error("CtrlClient::SendTLV: not connected");
+                pipetap::log::App.Error("CtrlClient::SendControlMessage: not connected");
                 return false;
             }
             h = h_cmd_;
         }
 
         DWORD wrote = 0;
-        pipetap::log::App.Infof("CtrlClient::SendTLV: type=%u total=%lu", (unsigned)type, (unsigned long)msg.size());
+        pipetap::log::App.Infof("CtrlClient::SendControlMessage: type=%u total=%lu", (unsigned)type, (unsigned long)msg.size());
         if (!WriteFile(h, msg.data(), (DWORD)msg.size(), &wrote, nullptr) || wrote != msg.size()) {
             DWORD le = GetLastError();
-            pipetap::log::App.Errorf("CtrlClient::SendTLV: write failed wrote=%lu/%lu le=%lu",
+            pipetap::log::App.Errorf("CtrlClient::SendControlMessage: write failed wrote=%lu/%lu le=%lu",
                 (unsigned long)wrote, (unsigned long)msg.size(), (unsigned long)le);
 
             {
@@ -169,7 +169,7 @@ namespace pipetap::ctrlclient {
         return true;
     }
 
-    bool CtrlClient::ReadNextMessage(DWORD cur_pid, PT_TlvHeader& hdr, std::vector<uint8_t>& val)
+    bool CtrlClient::ReadNextMessage(DWORD cur_pid, PT_ControlMessageHeader& hdr, std::vector<uint8_t>& val)
     {
         HANDLE ev_snapshot = INVALID_HANDLE_VALUE;
         {
@@ -252,7 +252,7 @@ namespace pipetap::ctrlclient {
                 }
             }
 
-            PT_TlvHeader hdr{};
+            PT_ControlMessageHeader hdr{};
             std::vector<uint8_t> val;
             if (!ReadNextMessage(cur_pid, hdr, val)) {
                 continue;

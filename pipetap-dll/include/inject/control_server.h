@@ -25,7 +25,7 @@ namespace pipetap::inject {
         void send_hello();
         void send_error(uint32_t code, const char* what);
 
-        void send_pipe_io(uint16_t tlv_type, HANDLE pipe,
+        void send_pipe_io(uint16_t message_type, HANDLE pipe,
             const void* buf, uint32_t total,
             uint8_t dir, uint64_t op_id,
             const char* apiName);
@@ -58,9 +58,9 @@ namespace pipetap::inject {
         static DWORD WINAPI control_pipe_thread_thunk(LPVOID);
         void control_pipe_thread();
 
-        void handle_inbound_tlv(HANDLE h);
+        void handle_inbound_commands(HANDLE h);
 
-        void send_tlv_streamed(uint16_t type,
+        void send_control_message(uint16_t type,
             const void* meta, uint32_t meta_len,
             const void* payload, uint32_t payload_len);
 

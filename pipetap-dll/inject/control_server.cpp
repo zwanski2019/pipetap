@@ -213,7 +213,7 @@ namespace pipetap::inject {
         strncpy_s(hello.proc_name, sizeof(hello.proc_name), name.c_str(), _TRUNCATE);
         log::printf("SendHello: pid=%lu exe=%s", (unsigned long)hello.pid, hello.proc_name);
 
-        send_tlv_streamed(PT_HELLO, &hello, (uint32_t)sizeof(hello), nullptr, 0);
+        send_control_message(PT_HELLO, &hello, (uint32_t)sizeof(hello), nullptr, 0);
     }
 
     void ControlServer::send_error(uint32_t code, const char* what)
@@ -224,10 +224,10 @@ namespace pipetap::inject {
         e.code = code;
         strncpy_s(e.what, sizeof(e.what), (what ? what : "err"), _TRUNCATE);
 
-        send_tlv_streamed(PT_ERROR, &e, (uint32_t)sizeof(e), nullptr, 0);
+        send_control_message(PT_ERROR, &e, (uint32_t)sizeof(e), nullptr, 0);
     }
 
-    void ControlServer::send_pipe_io(uint16_t tlv_type, HANDLE pipe,
+    void ControlServer::send_pipe_io(uint16_t message_type, HANDLE pipe,
         const void* buf, uint32_t total,
         uint8_t dir, uint64_t op_id,
         const char* apiName)
@@ -282,7 +282,7 @@ namespace pipetap::inject {
         const uint32_t image_len = meta.image_len;
         const uint32_t payload_len = sample;
 
-        std::vector<::pipetap::TlvFragment> fragments;
+        std::vector<::pipetap::ControlMessageFragment> fragments;
         fragments.reserve(1 + (name_len ? 1 : 0) + (api_len ? 1 : 0) + (image_len ? 1 : 0) + ((payload_len && buf) ? 1 : 0));
         fragments.push_back({ &meta, meta_len });
         if (name_len) fragments.push_back({ pipeName.data(), name_len });
@@ -290,7 +290,7 @@ namespace pipetap::inject {
         if (image_len) fragments.push_back({ peerImg.data(), image_len });
         if (payload_len && buf) fragments.push_back({ buf, payload_len });
 
-        auto msg = ::pipetap::BuildTlvMessage(tlv_type, fragments);
+        auto msg = ::pipetap::BuildControlMessage(message_type, fragments);
 
         AcquireSRWLockExclusive(&ctrl_lock_);
         {
@@ -319,7 +319,7 @@ namespace pipetap::inject {
         r.is_message_mode = is_message_mode;
         r.out_buf_hint = out_hint;
         r.in_buf_hint = in_hint;
-        send_tlv_streamed(PT_EVT_PROXY_OPENED, &r, sizeof(r), nullptr, 0);
+        send_control_message(PT_EVT_PROXY_OPENED, &r, sizeof(r), nullptr, 0);
     }
 
     void ControlServer::send_proxy_closed(uint64_t session_id,
@@ -331,7 +331,7 @@ namespace pipetap::inject {
         ev.session_id = session_id;
         ev.reason = reason;
         ev.win32_error = win32_error;
-        send_tlv_streamed(PT_EVT_PROXY_CLOSED, &ev, sizeof(ev), nullptr, 0);
+        send_control_message(PT_EVT_PROXY_CLOSED, &ev, sizeof(ev), nullptr, 0);
     }
 
     BOOL ControlServer::wait_for_edit_and_maybe_replace(uint64_t op_id,
@@ -412,7 +412,7 @@ namespace pipetap::inject {
 
             send_hello();
 
-            handle_inbound_tlv(hCmdSrv);
+            handle_inbound_commands(hCmdSrv);
 
             HANDLE myR = atomic_exchange_handle(ctrl_r_, INVALID_HANDLE_VALUE);
             HANDLE myW = atomic_exchange_handle(ctrl_w_, INVALID_HANDLE_VALUE);
@@ -454,7 +454,7 @@ namespace pipetap::inject {
             1, 0, 256 * 1024, 0, nullptr);
     }
 
-    void ControlServer::send_tlv_streamed(uint16_t type,
+    void ControlServer::send_control_message(uint16_t type,
         const void* meta, uint32_t meta_len,
         const void* payload, uint32_t payload_len)
     {
@@ -466,10 +466,10 @@ namespace pipetap::inject {
             return;
         }
 
-        std::vector<::pipetap::TlvFragment> fragments;
+        std::vector<::pipetap::ControlMessageFragment> fragments;
         if (meta_len && meta) fragments.push_back({ meta, meta_len });
         if (payload_len && payload) fragments.push_back({ payload, payload_len });
-        auto msg = ::pipetap::BuildTlvMessage(type, fragments);
+        auto msg = ::pipetap::BuildControlMessage(type, fragments);
 
         AcquireSRWLockExclusive(&ctrl_lock_);
         {
@@ -485,7 +485,7 @@ namespace pipetap::inject {
         ReleaseSRWLockExclusive(&ctrl_lock_);
     }
 
-    void ControlServer::handle_inbound_tlv(HANDLE h)
+    void ControlServer::handle_inbound_commands(HANDLE h)
     {
         for (;;)
         {
@@ -496,9 +496,9 @@ namespace pipetap::inject {
                 SuppressHooksGuard _guard;
                 if (!PeekNamedPipe(h, nullptr, 0, nullptr, &totalAvail, &bytesLeftMsg)) break;
             }
-            if (totalAvail < sizeof(PT_TlvHeader)) { Sleep(1); continue; }
+            if (totalAvail < sizeof(PT_ControlMessageHeader)) { Sleep(1); continue; }
 
-            PT_TlvHeader hdr{};
+            PT_ControlMessageHeader hdr{};
             {
                 SuppressHooksGuard _guard;
                 if (!::pipetap::PipeReadExact(h, &hdr, static_cast<DWORD>(sizeof(hdr)))) break;
@@ -624,7 +624,7 @@ namespace pipetap::inject {
                 break;
 
             default:
-                // Ignore unknown TLVs
+                // Ignore unknown control messages
                 break;
             }
         }

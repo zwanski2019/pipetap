@@ -89,7 +89,7 @@ namespace pipetap::transport {
             if (target_pipe_.size() > 0xFFFF) target_pipe_.resize(0xFFFF);
             op.name_len = static_cast<uint16_t>(target_pipe_.size());
 
-            if (!SendTLV_(PT_CMD_PROXY_OPEN, &op, sizeof(op),
+            if (!SendControlMessage_(PT_CMD_PROXY_OPEN, &op, sizeof(op),
                 target_pipe_.data(), (uint32_t)target_pipe_.size())) {
                 Disconnect();
                 return false;
@@ -156,7 +156,7 @@ namespace pipetap::transport {
         void Disconnect() {
             if (session_id_ != 0 && hCmd_ && hCmd_ != INVALID_HANDLE_VALUE) {
                 PT_ProxyClose c{ session_id_ };
-                (void)SendTLV_(PT_CMD_PROXY_CLOSE, &c, sizeof(c), nullptr, 0);
+                (void)SendControlMessage_(PT_CMD_PROXY_CLOSE, &c, sizeof(c), nullptr, 0);
             }
 
             stop_reader_.store(true, std::memory_order_release);
@@ -203,7 +203,7 @@ namespace pipetap::transport {
             { std::ostringstream oss; oss << "write: " << len << " bytes"; LogInfo(oss.str()); }
 
             PT_ProxySend s{ session_id_, len };
-            if (!SendTLV_(PT_CMD_PROXY_SEND, &s, sizeof(s), data, len)) {
+            if (!SendControlMessage_(PT_CMD_PROXY_SEND, &s, sizeof(s), data, len)) {
                 return false;
             }
 
@@ -300,16 +300,16 @@ namespace pipetap::transport {
             return s;
         }
 
-        bool SendTLV_(uint16_t type, const void* meta, uint32_t meta_len, const void* bytes, uint32_t bytes_len) {
+        bool SendControlMessage_(uint16_t type, const void* meta, uint32_t meta_len, const void* bytes, uint32_t bytes_len) {
             if (!hCmd_ || hCmd_ == INVALID_HANDLE_VALUE) {
                 last_error_ = "remote: cmd pipe not open";
                 LogError(last_error_);
                 return false;
             }
-            std::vector<::pipetap::TlvFragment> fragments;
+            std::vector<::pipetap::ControlMessageFragment> fragments;
             if (meta_len && meta) fragments.push_back({ meta, meta_len });
             if (bytes_len && bytes) fragments.push_back({ bytes, bytes_len });
-            auto msg = ::pipetap::BuildTlvMessage(type, fragments);
+            auto msg = ::pipetap::BuildControlMessage(type, fragments);
 
             DWORD wrote = 0;
             BOOL ok = WriteFile(hCmd_, msg.data(), (DWORD)msg.size(), &wrote, nullptr);
@@ -348,9 +348,9 @@ namespace pipetap::transport {
                     NotifyClosed_((le == ERROR_BROKEN_PIPE) ? 1u : 2u, le);
                     break;
                 }
-                if (avail < sizeof(PT_TlvHeader)) { Sleep(1); continue; }
+                if (avail < sizeof(PT_ControlMessageHeader)) { Sleep(1); continue; }
 
-                PT_TlvHeader hdr{};
+                PT_ControlMessageHeader hdr{};
                 if (!::pipetap::PipeReadExact(hEv_, &hdr, static_cast<DWORD>(sizeof(hdr)))) break;
                 if (hdr.length > (512u * 1024u * 1024u)) break;
 
