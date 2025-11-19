@@ -13,6 +13,7 @@
 #include "ui/replay.h"
 #include "ui/sharedui.h"
 #include "win/elevation.h"
+#include <functional>
 #include <string>
 #include <Windows.h>
 

@@ -56,6 +56,7 @@ namespace pipetap::ui::proxy {
     };
 
     static std::unordered_map<Tab*, TabState> g_tabState;
+    static TabState& RegisterTabIfNeeded(Tab* t);
 
     struct EditBindings {
         uint64_t& op;
@@ -66,6 +67,8 @@ namespace pipetap::ui::proxy {
         char* pipe;
         size_t pipe_size;
     };
+
+    static void SendEditReply(ctrlclient::CtrlClient* client, uint64_t op_id, bool replace, const char* bytes, size_t len);
 
     static EditBindings GetEditBindings(Tab& tab, bool is_request_side) {
         if (is_request_side) {
@@ -96,6 +99,89 @@ namespace pipetap::ui::proxy {
         if (bindings.buf_size) bindings.buf[0] = '\0';
         if (bindings.original_size) bindings.original[0] = '\0';
         if (bindings.pipe_size) bindings.pipe[0] = '\0';
+    }
+
+    static void CancelPendingEdit(Tab& tab, bool is_request_side) {
+        EditBindings bindings = GetEditBindings(tab, is_request_side);
+        std::lock_guard<std::mutex> lk(tab.s.edit_mtx);
+        if (!bindings.op) return;
+        SendEditReply(tab.client.get(), bindings.op, false, nullptr, 0);
+        ClearPendingLocked(bindings);
+    }
+
+    static bool TabHasSelection(Tab& tab) {
+        std::lock_guard<std::mutex> lk(tab.s.log_mtx);
+        return (tab.s.selected_row >= 0 && tab.s.selected_row < (int)tab.s.log.size());
+    }
+
+    struct ScopedTabHighlight {
+        int count = 0;
+        ScopedTabHighlight(bool highlight) {
+            if (highlight) {
+                ImGui::PushStyleColor(ImGuiCol_Tab, ImVec4(0.95f, 0.60f, 0.15f, 1.0f)); ++count;
+                ImGui::PushStyleColor(ImGuiCol_TabHovered, ImVec4(1.00f, 0.70f, 0.25f, 1.0f)); ++count;
+                ImGui::PushStyleColor(ImGuiCol_TabUnfocused, ImVec4(0.70f, 0.45f, 0.12f, 1.0f)); ++count;
+            }
+        }
+        ~ScopedTabHighlight() {
+            if (count) ImGui::PopStyleColor(count);
+        }
+    };
+
+    static Tab* CreateBlankTab(Manager& m, DWORD pid = 0)
+    {
+        auto tab = std::make_unique<Tab>();
+        tab->pid = pid;
+        Tab* raw = tab.get();
+        RegisterTabIfNeeded(raw);
+        m.tabs.push_back(std::move(tab));
+        return raw;
+    }
+
+    static void DrawRenamePopup(TabState& state)
+    {
+        using namespace ImGui;
+        if (!ImGui::BeginPopupContextItem())
+            return;
+
+        auto& buf = state.title_edit;
+        ImGui::TextUnformatted("Rename Tab");
+        ImGui::Separator();
+        ImGui::InputText("Name", buf.data(), buf.size());
+        if (ImGui::Button("Apply")) {
+            std::string new_name = buf.data();
+            if (new_name.empty()) {
+                new_name = std::string("#") + std::to_string(state.ordinal);
+                std::snprintf(buf.data(), buf.size(), "%s", new_name.c_str());
+            }
+            state.title = new_name;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset")) {
+            std::string def = std::string("#") + std::to_string(state.ordinal);
+            state.title = def;
+            std::snprintf(buf.data(), buf.size(), "%s", def.c_str());
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    static bool BeginProxyTabItem(Tab& tab, TabState& state, bool allow_close, bool& open)
+    {
+        using namespace ImGui;
+
+        char unique_id[64];
+        std::snprintf(unique_id, sizeof(unique_id), "tab_%p", (void*)&tab);
+
+        char label[128];
+        std::snprintf(label, sizeof(label), "%s##%s", state.title.c_str(), unique_id);
+
+        ScopedTabHighlight highlight(tab.has_unseen);
+        bool began = allow_close ? ImGui::BeginTabItem(label, &open) : ImGui::BeginTabItem(label);
+
+        DrawRenamePopup(state);
+        return began;
     }
 
     static TabState& RegisterTabIfNeeded(Tab* t) {
@@ -372,6 +458,125 @@ namespace pipetap::ui::proxy {
         EndDisabled();
     }
 
+    static void HandleActiveTabFocus(Tab& tab, bool is_active_tab, bool panel_focused)
+    {
+        using namespace ImGui;
+        if (!is_active_tab || !panel_focused) return;
+        tab.has_unseen = false;
+        if (IsKeyPressed(ImGuiKey_Escape)) {
+            std::lock_guard<std::mutex> lk(tab.s.log_mtx);
+            if (tab.s.selected_row >= 0) tab.s.selected_row = -1;
+        }
+    }
+
+    static void DrawConnectionControls(Tab& tab, TabState& state, Manager& mgr)
+    {
+        using namespace ImGui;
+
+        SeparatorText("Target");
+        SetNextItemWidth(80.0f);
+        InputScalar("PID", ImGuiDataType_U32, &tab.pid);
+
+        SameLine();
+        bool is_connected = (tab.client && tab.client->connected.load());
+
+        if (!is_connected) {
+            if (Button("Connect")) {
+                if (!tab.client) tab.client = std::make_unique<ctrlclient::CtrlClient>();
+                tab.client->StartForPid(tab.pid, BindHandler(mgr));
+                state.connecting = true;
+                state.connect_started_at = ImGui::GetTime();
+            }
+        }
+        else {
+            if (Button("Disconnect")) {
+                if (tab.client) {
+                    tab.client->Stop();
+                    tab.client->ClearLastError();
+                }
+                state.connecting = false;
+            }
+        }
+
+        SameLine();
+        if (is_connected) {
+            state.connecting = false;
+            TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "[connected]");
+        }
+        else {
+            std::string err = (tab.client ? tab.client->LastErrorForPid(tab.pid) : std::string());
+            if (state.connecting && err.empty()) {
+                float elapsed = (float)(ImGui::GetTime() - state.connect_started_at);
+                SetNextItemWidth(180.0f);
+                ProgressBar(-(float)ImGui::GetTime(), ImVec2(0, 0), "connecting...");
+                SameLine();
+                TextDisabled("(%.1fs)", elapsed);
+            }
+            else if (!err.empty()) {
+                state.connecting = false;
+                TextColored(ImVec4(0.9f, 0.2f, 0.2f, 1.0f), "[error] %s", err.c_str());
+            }
+            else {
+                TextColored(ImVec4(0.9f, 0.2f, 0.2f, 1.0f), "[disconnected]");
+            }
+        }
+
+        SameLine();
+        bool prev_req = tab.edit_requests;
+        bool prev_resp = tab.edit_responses;
+        Checkbox("Edit requests", &tab.edit_requests);
+        SameLine();
+        Checkbox("Edit responses", &tab.edit_responses);
+
+        if (prev_req && !tab.edit_requests) {
+            CancelPendingEdit(tab, /*request*/true);
+        }
+        if (prev_resp && !tab.edit_responses) {
+            CancelPendingEdit(tab, /*request*/false);
+        }
+    }
+
+    static void DrawEditorsContent(Tab& tab, float editor_inner_w, ImGuiWindowFlags editor_flags, float splitter_thickness)
+    {
+        const float min_side_w = 120.0f;
+
+        if (tab.edit_requests && tab.edit_responses) {
+            float left_w = (editor_inner_w - splitter_thickness) * tab.edit_split_ratio;
+            float right_w = editor_inner_w - splitter_thickness - left_w;
+
+            if (left_w < min_side_w) left_w = min_side_w;
+            if (right_w < min_side_w) right_w = min_side_w;
+            if (left_w + splitter_thickness + right_w > editor_inner_w) {
+                if (left_w > right_w) left_w = editor_inner_w - splitter_thickness - right_w;
+                else                  right_w = editor_inner_w - splitter_thickness - left_w;
+                if (left_w < min_side_w) left_w = min_side_w;
+                if (right_w < min_side_w) right_w = min_side_w;
+            }
+
+            ImGui::BeginChild("##edit_left", ImVec2(left_w, -1), true, editor_flags);
+            DrawEditorOneSide(tab, /*is_request_side*/true);
+            ImGui::EndChild();
+
+            ImGui::SameLine(0.0f, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+            ImGui::BeginChild("##edit_splitter", ImVec2(splitter_thickness, -1), false, editor_flags
+                | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoDecoration);
+            HSplitterRatio("##hsplit", splitter_thickness, min_side_w, min_side_w, editor_inner_w, tab.edit_split_ratio);
+            ImGui::EndChild();
+            ImGui::PopStyleVar();
+
+            ImGui::SameLine(0.0f, 0.0f);
+            ImGui::BeginChild("##edit_right", ImVec2(right_w, -1), true, editor_flags);
+            DrawEditorOneSide(tab, /*is_request_side*/false);
+            ImGui::EndChild();
+        }
+        else {
+            ImGui::BeginChild("##edit_single", ImVec2(editor_inner_w, -1), true, editor_flags);
+            DrawEditorOneSide(tab, /*is_request_side*/tab.edit_requests);
+            ImGui::EndChild();
+        }
+    }
+
     static void DrawSelection(Tab& tab)
     {
         using namespace ImGui;
@@ -411,15 +616,9 @@ namespace pipetap::ui::proxy {
         EndChild();
     }
 
-    static void DrawTraffic(Tab& tab, Manager& mgr)
+    static void DrawTrafficToolbar(Tab& tab, TabState& state)
     {
         using namespace ImGui;
-
-        DrainIncomingToLog(&tab);
-
-        SeparatorText("Traffic Log");
-
-        TabState& state = RegisterTabIfNeeded(&tab);
 
         if (Button("Clear")) {
             std::lock_guard<std::mutex> lk(tab.s.log_mtx);
@@ -444,8 +643,7 @@ namespace pipetap::ui::proxy {
         SameLine();
 
         SetNextItemWidth(260.f);
-        bool needle_changed = InputTextWithHint("##flt", "filter", tab.filter_text, IM_ARRAYSIZE(tab.filter_text));
-        if (needle_changed) {
+        if (InputTextWithHint("##flt", "filter", tab.filter_text, IM_ARRAYSIZE(tab.filter_text))) {
             auto& fc = state.filters;
             fc.needle_lower = pipetap::sharedui::ToLowerStr(tab.filter_text);
             fc.dirty = true;
@@ -467,14 +665,29 @@ namespace pipetap::ui::proxy {
                 pipetap::log::App.Infof("Traffic log exported.");
             }
         }
+    }
 
-        std::vector<int>* index_map_ptr = nullptr;
-        {
-            auto& fc = state.filters;
-            std::lock_guard<std::mutex> lk(tab.s.log_mtx);
-            pipetap::sharedui::EnsureFilterUpToDate(tab.s.log, fc);
-            index_map_ptr = &fc.indices;
-        }
+    static std::vector<int>* PrepareFilterIndices(Tab& tab, TabState& state)
+    {
+        auto& fc = state.filters;
+        std::lock_guard<std::mutex> lk(tab.s.log_mtx);
+        pipetap::sharedui::EnsureFilterUpToDate(tab.s.log, fc);
+        return &fc.indices;
+    }
+
+    static void DrawTraffic(Tab& tab, Manager& mgr)
+    {
+        using namespace ImGui;
+
+        DrainIncomingToLog(&tab);
+
+        SeparatorText("Traffic Log");
+
+        TabState& state = RegisterTabIfNeeded(&tab);
+
+        DrawTrafficToolbar(tab, state);
+
+        std::vector<int>* index_map_ptr = PrepareFilterIndices(tab, state);
 
         BeginChild("##proxy_log_child", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
 
@@ -514,94 +727,11 @@ namespace pipetap::ui::proxy {
 
         PushID(&tab);
 
-        if (is_active_tab && panel_focused) {
-            tab.has_unseen = false;
-
-            if (IsKeyPressed(ImGuiKey_Escape)) {
-                std::lock_guard<std::mutex> lk(tab.s.log_mtx);
-                if (tab.s.selected_row >= 0)
-                    tab.s.selected_row = -1;
-            }
-        }
-
-        {
-            SeparatorText("Target");
-            SetNextItemWidth(80.0f);
-            InputScalar("PID", ImGuiDataType_U32, &tab.pid);
-
-            SameLine();
-            bool is_connected = (tab.client && tab.client->connected.load());
-
-            if (!is_connected) {
-                if (Button("Connect")) {
-                    if (!tab.client) tab.client = std::make_unique<ctrlclient::CtrlClient>();
-                    tab.client->StartForPid(tab.pid, BindHandler(mgr));
-                    state.connecting = true;
-                    state.connect_started_at = ImGui::GetTime();
-                }
-            }
-            else {
-                if (Button("Disconnect")) {
-                    if (tab.client) {
-                        tab.client->Stop();
-                        tab.client->ClearLastError();
-                    }
-                    state.connecting = false;
-                }
-            }
-
-            SameLine();
-            if (is_connected) {
-                state.connecting = false;
-                TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "[connected]");
-            }
-            else {
-                std::string err = (tab.client ? tab.client->LastErrorForPid(tab.pid) : std::string());
-                if (state.connecting && err.empty()) {
-                    float elapsed = (float)(ImGui::GetTime() - state.connect_started_at);
-                    SetNextItemWidth(180.0f);
-                    ProgressBar(-(float)ImGui::GetTime(), ImVec2(0, 0), "connecting...");
-                    SameLine();
-                    TextDisabled("(%.1fs)", elapsed);
-                }
-                else if (!err.empty()) {
-                    state.connecting = false;
-                    TextColored(ImVec4(0.9f, 0.2f, 0.2f, 1.0f), "[error] %s", err.c_str());
-                }
-                else {
-                    TextColored(ImVec4(0.9f, 0.2f, 0.2f, 1.0f), "[disconnected]");
-                }
-            }
-
-            SameLine();
-            bool prev_req = tab.edit_requests;
-            bool prev_resp = tab.edit_responses;
-            Checkbox("Edit requests", &tab.edit_requests);
-            SameLine();
-            Checkbox("Edit responses", &tab.edit_responses);
-
-            if (prev_req && !tab.edit_requests) {
-                std::lock_guard<std::mutex> lk(tab.s.edit_mtx);
-                if (tab.s.pending_req_op) {
-                    SendEditReply(tab.client.get(), tab.s.pending_req_op, false, nullptr, 0);
-                    tab.s.pending_req_op = 0; tab.s.req_buf[0] = '\0'; tab.s.req_original[0] = '\0';
-                }
-            }
-            if (prev_resp && !tab.edit_responses) {
-                std::lock_guard<std::mutex> lk(tab.s.edit_mtx);
-                if (tab.s.pending_resp_op) {
-                    SendEditReply(tab.client.get(), tab.s.pending_resp_op, false, nullptr, 0);
-                    tab.s.pending_resp_op = 0; tab.s.resp_buf[0] = '\0'; tab.s.resp_original[0] = '\0';
-                }
-            }
-        }
+        HandleActiveTabFocus(tab, is_active_tab, panel_focused);
+        DrawConnectionControls(tab, state, mgr);
 
         const bool editors_visible = (tab.edit_requests || tab.edit_responses);
-        bool has_selection = false;
-        {
-            std::lock_guard<std::mutex> lk(tab.s.log_mtx);
-            has_selection = (tab.s.selected_row >= 0 && tab.s.selected_row < (int)tab.s.log.size());
-        }
+        const bool has_selection = TabHasSelection(tab);
 
         if (editors_visible) SeparatorText("Payload Editor");
 
@@ -615,91 +745,30 @@ namespace pipetap::ui::proxy {
         if (!editors_visible) tab.edit_h = 0.0f;
         else                  tab.edit_h = std::clamp(tab.edit_h, min_h, std::max(min_h, total_h - 2.0f * min_h));
 
-        float rest_h = total_h - tab.edit_h;
-
-        if (has_selection) {
-            tab.data_h = std::clamp(tab.data_h, min_h, std::max(min_h, rest_h - min_h));
-        }
-        else {
-            tab.data_h = 0.0f;
-        }
-        float log_h = rest_h - tab.data_h;
+        float rest_h = editors_visible ? (total_h - tab.edit_h) : total_h;
 
         if (editors_visible) {
             ImGui::BeginChild("##proxy_editors", ImVec2(0, tab.edit_h), false,
                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-
             const float editor_inner_w = ImGui::GetContentRegionAvail().x;
-            const float hsplit_thick = 6.0f;
-            const float min_side_w = 120.0f;
-
             ImGuiWindowFlags editor_flags =
                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
-
-            if (tab.edit_requests && tab.edit_responses) {
-                float left_w = (editor_inner_w - hsplit_thick) * tab.edit_split_ratio;
-                float right_w = editor_inner_w - hsplit_thick - left_w;
-
-                if (left_w < min_side_w) left_w = min_side_w;
-                if (right_w < min_side_w) right_w = min_side_w;
-                if (left_w + hsplit_thick + right_w > editor_inner_w) {
-                    if (left_w > right_w) left_w = editor_inner_w - hsplit_thick - right_w;
-                    else                  right_w = editor_inner_w - hsplit_thick - left_w;
-                    if (left_w < min_side_w) left_w = min_side_w;
-                    if (right_w < min_side_w) right_w = min_side_w;
-                }
-
-                // Left editor
-                ImGui::BeginChild("##edit_left", ImVec2(left_w, -1), true, editor_flags);
-                DrawEditorOneSide(tab, /*is_request_side*/true);
-                ImGui::EndChild();
-
-                ImGui::SameLine(0.0f, 0.0f);
-                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-                ImGui::BeginChild("##edit_splitter", ImVec2(hsplit_thick, -1), false, editor_flags
-                    | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoDecoration);
-                HSplitterRatio("##hsplit", hsplit_thick, min_side_w, min_side_w, editor_inner_w, tab.edit_split_ratio);
-                ImGui::EndChild();
-                ImGui::PopStyleVar();
-
-                // Right editor
-                ImGui::SameLine(0.0f, 0.0f);
-                ImGui::BeginChild("##edit_right", ImVec2(right_w, -1), true, editor_flags);
-                DrawEditorOneSide(tab, /*is_request_side*/false);
-                ImGui::EndChild();
-            }
-            else {
-                // Single editor: use the exact same inner width as the two-editor math
-                ImGui::BeginChild("##edit_single", ImVec2(editor_inner_w, -1), true, editor_flags);
-                DrawEditorOneSide(tab, /*is_request_side*/tab.edit_requests);
-                ImGui::EndChild();
-            }
-
+            DrawEditorsContent(tab, editor_inner_w, editor_flags, splitter_thickness);
             ImGui::EndChild();
 
             VSplitter("##split_edit_rest", splitter_thickness, min_h, min_h, tab.edit_h, rest_h);
             rest_h = std::max(min_h, rest_h);
             tab.edit_h = std::max(min_h, tab.edit_h);
+        }
 
-            if (has_selection) {
-                tab.data_h = std::clamp(tab.data_h, min_h, std::max(min_h, rest_h - min_h));
-                log_h = rest_h - tab.data_h;
-            }
-            else {
-                tab.data_h = 0.0f;
-                log_h = rest_h;
-            }
+        float log_h = rest_h;
+        if (has_selection) {
+            tab.data_h = std::clamp(tab.data_h, min_h, std::max(min_h, rest_h - min_h));
+            log_h = rest_h - tab.data_h;
         }
         else {
-            rest_h = total_h;
-            if (has_selection) {
-                tab.data_h = std::clamp(tab.data_h, min_h, std::max(min_h, rest_h - min_h));
-                log_h = rest_h - tab.data_h;
-            }
-            else {
-                tab.data_h = 0.0f;
-                log_h = rest_h;
-            }
+            tab.data_h = 0.0f;
+            log_h = rest_h;
         }
 
         if (has_selection) {
@@ -721,9 +790,8 @@ namespace pipetap::ui::proxy {
 
     void StartNewTabAndConnect(Manager& m, std::uint32_t pid)
     {
-        auto tab = std::make_unique<Tab>();
-        tab->pid = pid;
-        TabState& state = RegisterTabIfNeeded(tab.get());
+        Tab* tab = CreateBlankTab(m, pid);
+        TabState& state = RegisterTabIfNeeded(tab);
 
         tab->client = std::make_unique<ctrlclient::CtrlClient>();
         tab->client->StartForPid(tab->pid, BindHandler(m));
@@ -731,7 +799,6 @@ namespace pipetap::ui::proxy {
         state.connecting = true;
         state.connect_started_at = ImGui::GetTime();
 
-        m.tabs.push_back(std::move(tab));
         m.active = static_cast<int>(m.tabs.size()) - 1;
     }
 
@@ -742,6 +809,12 @@ namespace pipetap::ui::proxy {
         }
 
         return nullptr;
+    }
+
+    static Tab* EnsureTabForPid(Manager& m, DWORD pid)
+    {
+        if (Tab* existing = FindTabByPid(m, pid)) return existing;
+        return CreateBlankTab(m, pid);
     }
 
     void PumpAutoConnect(Manager& m)
@@ -765,8 +838,7 @@ namespace pipetap::ui::proxy {
     void Draw(Manager& m)
     {
         if (m.tabs.empty()) {
-            m.tabs.push_back(std::make_unique<Tab>());
-            RegisterTabIfNeeded(m.tabs.back().get());
+            CreateBlankTab(m);
             m.active = 0;
         }
 
@@ -779,54 +851,9 @@ namespace pipetap::ui::proxy {
                 Tab& t = *m.tabs[i];
                 TabState& state = RegisterTabIfNeeded(&t);
 
-                const std::string& visible = state.title;
-
-                char unique_id[64];
-                std::snprintf(unique_id, sizeof(unique_id), "tab_%p", (void*)&t);
-
-                char label[128];
-                std::snprintf(label, sizeof(label), "%s##%s", visible.c_str(), unique_id);
-
                 bool open = true;
                 const bool allow_close = (m.tabs.size() > 1);
-
-                int color_pushed = 0;
-                if (t.has_unseen) {
-                    ImGui::PushStyleColor(ImGuiCol_Tab, ImVec4(0.95f, 0.60f, 0.15f, 1.0f)); ++color_pushed;
-                    ImGui::PushStyleColor(ImGuiCol_TabHovered, ImVec4(1.00f, 0.70f, 0.25f, 1.0f)); ++color_pushed;
-                    ImGui::PushStyleColor(ImGuiCol_TabUnfocused, ImVec4(0.70f, 0.45f, 0.12f, 1.0f)); ++color_pushed;
-                }
-
-                bool began = false;
-                if (allow_close) began = ImGui::BeginTabItem(label, &open);
-                else             began = ImGui::BeginTabItem(label);
-
-                if (color_pushed) ImGui::PopStyleColor(color_pushed);
-
-                if (ImGui::BeginPopupContextItem()) {
-                    auto& buf = state.title_edit;
-                    ImGui::TextUnformatted("Rename Tab");
-                    ImGui::Separator();
-                    ImGui::InputText("Name", buf.data(), buf.size());
-                    if (ImGui::Button("Apply")) {
-                        std::string new_name = buf.data();
-                        if (new_name.empty()) {
-                            new_name = std::string("#") + std::to_string(state.ordinal);
-                            std::snprintf(buf.data(), buf.size(), "%s", new_name.c_str());
-                        }
-                        state.title = new_name;
-                        ImGui::CloseCurrentPopup();
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button("Reset")) {
-                        std::string def = std::string("#") + std::to_string(state.ordinal);
-                        state.title = def;
-                        std::snprintf(buf.data(), buf.size(), "%s", def.c_str());
-                        ImGui::CloseCurrentPopup();
-                    }
-                    ImGui::EndPopup();
-                }
-
+                bool began = BeginProxyTabItem(t, state, allow_close, open);
                 if (began) {
                     m.active = i;
                     DrawOneTab(t, /*is_active_tab*/true, m.panel_focused, m);
@@ -845,8 +872,7 @@ namespace pipetap::ui::proxy {
 
             // trailing buttons
             if (ImGui::TabItemButton("+", ImGuiTabItemFlags_Trailing)) {
-                m.tabs.push_back(std::make_unique<Tab>());
-                RegisterTabIfNeeded(m.tabs.back().get());
+                CreateBlankTab(m);
                 m.active = (int)m.tabs.size() - 1;
             }
 
@@ -861,15 +887,7 @@ namespace pipetap::ui::proxy {
             pipetap::log::App.Infof("Proxy: HELLO pid=%lu name='%.*s'", (unsigned long)hello.pid,
                 (int)strnlen(hello.proc_name, sizeof(hello.proc_name)), hello.proc_name);
 
-            Tab* target = nullptr;
-            for (auto& up : mgr.tabs) { if (up->pid == hello.pid) { target = up.get(); break; } }
-            if (!target) {
-                auto t = std::make_unique<Tab>();
-                t->pid = hello.pid;
-                target = t.get();
-                RegisterTabIfNeeded(target);
-                mgr.tabs.push_back(std::move(t));
-            }
+            Tab* target = EnsureTabForPid(mgr, hello.pid);
             target->has_unseen = true;
             return;
         }
@@ -902,15 +920,7 @@ namespace pipetap::ui::proxy {
             std::string peer_img = (view.peer_image && view.image_len)
                 ? std::string(view.peer_image, view.image_len) : std::string();
 
-            Tab* target = nullptr;
-            for (auto& up : mgr.tabs) { if (up->pid == meta.pid) { target = up.get(); break; } }
-            if (!target) {
-                auto t = std::make_unique<Tab>();
-                t->pid = meta.pid;
-                target = t.get();
-                RegisterTabIfNeeded(target);
-                mgr.tabs.push_back(std::move(t));
-            }
+            Tab* target = EnsureTabForPid(mgr, meta.pid);
 
             std::string data_printable;
             if (hdr.type != PT_PIPE_EVENT && view.payload && view.payload_len) {

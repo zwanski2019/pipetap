@@ -127,6 +127,75 @@ namespace pipetap::ui::replay {
     };
 
     static std::unordered_map<Tab*, ReplayTabState> g_tabState;
+    static ReplayTabState& RegisterTabIfNeeded(Tab* t);
+
+    struct ScopedTabHighlight {
+        int count = 0;
+        ScopedTabHighlight(bool highlight) {
+            if (highlight) {
+                ImGui::PushStyleColor(ImGuiCol_Tab, ImVec4(0.95f, 0.60f, 0.15f, 1.0f)); ++count;
+                ImGui::PushStyleColor(ImGuiCol_TabHovered, ImVec4(1.00f, 0.70f, 0.25f, 1.0f)); ++count;
+                ImGui::PushStyleColor(ImGuiCol_TabUnfocused, ImVec4(0.70f, 0.45f, 0.12f, 1.0f)); ++count;
+            }
+        }
+        ~ScopedTabHighlight() {
+            if (count) ImGui::PopStyleColor(count);
+        }
+    };
+
+    static Tab* CreateBlankTab(Manager& m)
+    {
+        auto tab = std::make_unique<Tab>();
+        Tab* raw = tab.get();
+        RegisterTabIfNeeded(raw);
+        m.tabs.push_back(std::move(tab));
+        return raw;
+    }
+
+    static void DrawRenamePopup(ReplayTabState& state)
+    {
+        using namespace ImGui;
+        if (!ImGui::BeginPopupContextItem())
+            return;
+
+        auto& buf = state.title_edit;
+        ImGui::TextUnformatted("Rename Tab");
+        ImGui::Separator();
+        ImGui::InputText("Name", buf.data(), buf.size());
+        if (ImGui::Button("Apply")) {
+            std::string new_name = buf.data();
+            if (new_name.empty()) {
+                new_name = std::string("#") + std::to_string(state.ordinal);
+                std::snprintf(buf.data(), buf.size(), "%s", new_name.c_str());
+            }
+            state.title = new_name;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset")) {
+            std::string def = std::string("#") + std::to_string(state.ordinal);
+            state.title = def;
+            std::snprintf(buf.data(), buf.size(), "%s", def.c_str());
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    static bool BeginReplayTabItem(Tab& tab, ReplayTabState& state, bool allow_close, bool& open)
+    {
+        using namespace ImGui;
+
+        char unique_id[64];
+        std::snprintf(unique_id, sizeof(unique_id), "replay_tab_%p", (void*)&tab);
+
+        char label[256];
+        std::snprintf(label, sizeof(label), "%s##%s", state.title.c_str(), unique_id);
+
+        ScopedTabHighlight highlight(tab.has_unseen);
+        bool began = allow_close ? ImGui::BeginTabItem(label, &open) : ImGui::BeginTabItem(label);
+        DrawRenamePopup(state);
+        return began;
+    }
 
     static ReplayTabState& RegisterTabIfNeeded(Tab* t) {
         IM_ASSERT(t && "RegisterTabIfNeeded called with null Tab*");
@@ -150,6 +219,29 @@ namespace pipetap::ui::replay {
         if (!t) return;
         g_tabState.erase(t);
     }
+
+    static void SyncTxBufFromBytes(State& s)
+    {
+        std::string view_utf8 = s.tx_text_is_wide
+            ? Utf16LEToUtf8(s.tx_bytes)
+            : std::string((const char*)s.tx_bytes.data(),
+                (const char*)s.tx_bytes.data() + s.tx_bytes.size());
+        std::memset(s.tx_buf, 0, sizeof(s.tx_buf));
+        size_t limit = std::min(view_utf8.size(), sizeof(s.tx_buf) - 1);
+        if (limit) std::memcpy(s.tx_buf, view_utf8.data(), limit);
+    }
+
+    static void SyncTxBytesFromBuf(State& s)
+    {
+        if (s.tx_text_is_wide) Utf8ToUtf16LE(s.tx_buf, s.tx_bytes);
+        else {
+            size_t n = std::strlen(s.tx_buf);
+            s.tx_bytes.assign((const uint8_t*)s.tx_buf, (const uint8_t*)s.tx_buf + n);
+        }
+    }
+
+    static void DrawRequestPane(State& s, bool is_connected, uint64_t& nextId);
+    static void DrawResponsePane(Tab& tab, bool is_connected, uint64_t& nextId);
 
     static void DrawControlChannel(State& s)
     {
@@ -258,6 +350,321 @@ namespace pipetap::ui::replay {
         }
     }
 
+    static void DrawRequestPane(State& s, bool is_connected, uint64_t& nextId)
+    {
+        using namespace ImGui;
+
+        AlignTextToFramePadding();
+        TextUnformatted("Request");
+        SameLine();
+        TextDisabled("| Mode:");
+        SameLine();
+        bool hex_sel = s.tx_is_hex;
+        if (pipetap::sharedui::SegmentedToggle("req_mode", "Text", "Hex", hex_sel)) s.tx_is_hex = hex_sel;
+
+        SameLine();
+        BeginDisabled(s.tx_is_hex);
+        TextDisabled("| Encoding:");
+        SameLine();
+        bool wide_sel = s.tx_text_is_wide;
+        if (pipetap::sharedui::SegmentedToggle("req_enc", "UTF-8", "UTF-16", wide_sel)) {
+            s.tx_text_is_wide = wide_sel;
+            if (!s.tx_is_hex) SyncTxBytesFromBuf(s);
+        }
+        EndDisabled();
+
+        SameLine();
+        TextDisabled("| %zu byte(s)", s.tx_bytes.size());
+
+        Separator();
+
+        const ImGuiStyle& style = GetStyle();
+        const float footer_extra_pad = style.FramePadding.y;
+        const float reserved_footer = GetFrameHeightWithSpacing() + footer_extra_pad;
+
+        if (s.focus_editor_next) { SetKeyboardFocusHere(); s.focus_editor_next = false; }
+        ImVec2 avail = GetContentRegionAvail();
+        ImVec2 editor_size(-FLT_MIN, std::max(0.0f, avail.y - reserved_footer));
+
+        if (!s.tx_is_hex) {
+            std::string cur_utf8 = s.tx_text_is_wide
+                ? Utf16LEToUtf8(s.tx_bytes)
+                : std::string((const char*)s.tx_bytes.data(),
+                    (const char*)s.tx_bytes.data() + s.tx_bytes.size());
+            size_t limit = std::min(cur_utf8.size(), sizeof(s.tx_buf) - 1);
+            bool needs_sync = (std::strncmp(s.tx_buf, cur_utf8.c_str(), limit) != 0) ||
+                (std::strlen(s.tx_buf) != limit);
+            if (needs_sync) {
+                std::memset(s.tx_buf, 0, sizeof(s.tx_buf));
+                if (limit) std::memcpy(s.tx_buf, cur_utf8.data(), limit);
+            }
+
+            if (InputTextMultiline("##tx_text", s.tx_buf, IM_ARRAYSIZE(s.tx_buf),
+                editor_size,
+                ImGuiInputTextFlags_AllowTabInput | ImGuiInputTextFlags_NoHorizontalScroll))
+            {
+                SyncTxBytesFromBuf(s);
+            }
+        }
+        else {
+            s.tx_hex.UseDefaultResizeFor(s.tx_bytes);
+            s.tx_hex.OptAutoExtend = true;
+            s.tx_hex.OptShowOptions = true;
+            s.tx_hex.ReadOnly = false;
+
+            BeginChild("##tx_hex_child", editor_size, false,
+                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            void* memptr = s.tx_bytes.empty() ? nullptr : (void*)s.tx_bytes.data();
+            size_t memsz = s.tx_bytes.size();
+            if (s.tx_bytes.empty()) { s.tx_bytes.resize(1, 0); memptr = s.tx_bytes.data(); memsz = 1; }
+            s.tx_hex.DrawContents(memptr, memsz, 0);
+            EndChild();
+        }
+
+        const ImGuiStyle& st = GetStyle();
+        const float gap = st.ItemInnerSpacing.x;
+
+        const char* L_send = "Send";
+        const char* L_paste = "Paste";
+        const char* L_clear = "Clear TX";
+
+        auto btn_w = [&](const char* vis) { return CalcTextSize(vis).x + st.FramePadding.x * 2.0f; };
+        float total_w = btn_w(L_send) + gap + btn_w(L_paste) + gap + btn_w(L_clear);
+
+        SetCursorPosY(GetCursorPosY() + st.ItemInnerSpacing.y);
+        float x = GetCursorPosX() + (GetContentRegionAvail().x - total_w);
+        if (x < GetCursorPosX()) x = GetCursorPosX();
+        SetCursorPosX(x);
+
+        bool do_send = false;
+        BeginDisabled(!is_connected);
+        if (Button(L_send)) do_send = true;
+        EndDisabled();
+
+        SameLine(0.0f, gap);
+        if (Button(L_paste)) {
+            const char* clip = ImGui::GetClipboardText();
+            if (clip && *clip) {
+                s.tx_bytes.assign(clip, clip + std::strlen(clip));
+                SyncTxBufFromBytes(s);
+                s.focus_editor_next = true;
+            }
+        }
+
+        SameLine(0.0f, gap);
+        if (Button(L_clear)) { s.tx_bytes.clear(); s.tx_buf[0] = '\0'; }
+
+        SameLine(0.0f, gap);
+        BeginDisabled(!is_connected);
+        if (Button("Load RX")) {
+            s.tx_bytes.assign(s.rx_text.begin(), s.rx_text.end());
+            SyncTxBufFromBytes(s);
+            s.focus_editor_next = true;
+        }
+        EndDisabled();
+
+        if (do_send) {
+            const std::vector<uint8_t>& out = s.tx_bytes;
+            std::string rx;
+
+            if (is_connected) {
+                if (s.use_remote && s.rclient) {
+                    if (!s.rclient->WriteAll(out.data(), (DWORD)out.size())) {
+                        pipetap::log::App.Error((std::string("[replay] remote write failed: ") + s.rclient->LastError()).c_str());
+                    }
+                    else {
+                        auto mode = s.rclient->Mode();
+                        (void)((mode == transport::RemoteNamedPipeClient::ReadMode::Message)
+                            ? s.rclient->ReadMessage(rx, 1 << 20, 200)
+                            : s.rclient->ReadSome(rx, 1 << 20, 200));
+                    }
+                }
+                else if (s.client) {
+                    if (!s.client->WriteAll(out.data(), (DWORD)out.size())) {
+                        pipetap::log::App.Error((std::string("[replay] write failed: ") + s.client->LastError()).c_str());
+                    }
+                    else {
+                        auto mode = s.client->Mode();
+                        (void)((mode == transport::NamedPipeClient::ReadMode::Message)
+                            ? s.client->ReadMessage(rx, 1 << 20, 200)
+                            : s.client->ReadSome(rx, 1 << 20, 200));
+                    }
+                }
+            }
+
+            uint32_t peer_pid = 0;
+            std::string peer_image;
+            if (!s.use_remote && s.client) {
+                peer_pid = s.client->ServerPid();
+                peer_image = s.client->ServerImage();
+            }
+            else if (s.use_remote && s.rclient) {
+                peer_pid = s.rclient->ServerPid();
+                peer_image = s.rclient->ServerImage();
+            }
+
+            pipetap::sharedui::MsgLogEntry tx;
+            tx.id = nextId++;
+            tx.time = pipetap::sharedui::NowTimeString();
+            tx.pipe = (s.target_pipe[0] ? std::string(s.target_pipe) : std::string("(pipe)"));
+            tx.dir = pipetap::sharedui::Direction::Out;
+            tx.size = out.size();
+            tx.data = pipetap::sharedui::MakePrintablePreview(out);
+            tx.snippet = pipetap::sharedui::MakeSnippet(tx.data);
+            tx.raw.assign(out.begin(), out.end());
+            tx.peer_pid = peer_pid;
+            tx.peer_image = peer_image;
+            tx.is_event = false;
+            tx.winapi = "Write";
+            s.log.push_back(std::move(tx));
+
+            if (!rx.empty()) {
+                s.rx_text = rx;
+                pipetap::sharedui::MsgLogEntry ent;
+                ent.id = nextId++;
+                ent.time = pipetap::sharedui::NowTimeString();
+                ent.pipe = (s.target_pipe[0] ? std::string(s.target_pipe) : std::string("(pipe)"));
+                ent.dir = pipetap::sharedui::Direction::In;
+                ent.size = rx.size();
+
+                std::vector<uint8_t> rx_bytes(rx.begin(), rx.end());
+                ent.data = pipetap::sharedui::MakePrintablePreview(rx_bytes);
+                ent.snippet = pipetap::sharedui::MakeSnippet(ent.data);
+                ent.raw.assign(rx_bytes.begin(), rx_bytes.end());
+
+                ent.peer_pid = peer_pid;
+                ent.peer_image = peer_image;
+                ent.is_event = false;
+                ent.winapi = "Read";
+                s.log.push_back(std::move(ent));
+            }
+        }
+    }
+
+    static void DrawResponsePane(Tab& tab, bool is_connected, uint64_t& nextId)
+    {
+        using namespace ImGui;
+        State& s = tab.s;
+        ReplayTabState& state = RegisterTabIfNeeded(&tab);
+
+        AlignTextToFramePadding();
+        TextUnformatted("Response");
+        SameLine();
+        TextDisabled("| Mode:");
+        SameLine();
+        bool& rx_is_hex = state.rx_is_hex;
+        (void)pipetap::sharedui::SegmentedToggle("resp_mode", "Text", "Hex", rx_is_hex);
+
+        SameLine();
+        TextDisabled("| %zu byte(s)", s.rx_text.size());
+        SameLine();
+        {
+            const char* L_copy = "Copy...";
+            const char* L_clear = "Clear RX";
+            std::vector<uint8_t> resp_bytes(s.rx_text.begin(), s.rx_text.end());
+            pipetap::ui::DrawCopyPopupForBytes("copy_resp_popup", resp_bytes, L_copy);
+            SameLine();
+            BeginDisabled(s.rx_text.empty());
+            if (Button(L_clear)) s.rx_text.clear();
+            EndDisabled();
+        }
+
+        Separator();
+
+        const ImGuiStyle& style = GetStyle();
+        const float footer_extra_pad = style.FramePadding.y;
+        const float reserved_footer = GetFrameHeightWithSpacing() + footer_extra_pad;
+
+        ImVec2 avail = GetContentRegionAvail();
+        ImVec2 editor_size(-FLT_MIN, std::max(0.0f, avail.y - reserved_footer));
+
+        if (!rx_is_hex) {
+            const char* rx_cstr = s.rx_text.c_str();
+            InputTextMultiline("##rx_view",
+                const_cast<char*>(rx_cstr),
+                (size_t)(s.rx_text.size() + 1),
+                editor_size,
+                ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_NoHorizontalScroll);
+        }
+        else {
+            auto& hex = state.rx_hex;
+            std::vector<uint8_t> bytes(s.rx_text.begin(), s.rx_text.end());
+            void* memptr = bytes.empty() ? nullptr : (void*)bytes.data();
+            size_t memsz = bytes.size();
+            if (bytes.empty()) { bytes.resize(1, 0); memptr = bytes.data(); memsz = 1; }
+            BeginChild("##rx_hex_child", editor_size, false,
+                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            hex.ReadOnly = true;
+            hex.DrawContents(memptr, memsz, 0);
+            EndChild();
+        }
+
+        const char* L_more = "Read More";
+        float btn_w = CalcTextSize(L_more).x + style.FramePadding.x * 2.0f;
+
+        SetCursorPosY(GetCursorPosY() + style.ItemInnerSpacing.y);
+        float x = GetCursorPosX() + (GetContentRegionAvail().x - btn_w);
+        if (x < GetCursorPosX()) x = GetCursorPosX();
+        SetCursorPosX(x);
+
+        bool pressed = false;
+        BeginDisabled(!is_connected);
+        pressed = Button(L_more);
+        EndDisabled();
+
+        if (IsItemHovered(ImGuiHoveredFlags_DelayNone | ImGuiHoveredFlags_AllowWhenDisabled)) {
+            SetTooltip(
+                "Reading additional bytes is best-effort:\n"
+                "- If no data is available right now, nothing will happen.\n"
+                "- Message mode: next complete message if available.\n"
+                "- Byte mode: may return partial fragments.\n"
+                "- A short timeout is used; inactivity often returns nothing.\n"
+                "- Notes/timeouts/errors appear in the Status panel.");
+        }
+
+        if (pressed) {
+            std::string rx_more;
+            bool read_ok = false;
+            constexpr DWORD kMax = 1 << 20, kWaitMs = 50;
+
+            if (s.use_remote && s.rclient) {
+                auto mode = s.rclient->Mode();
+                read_ok = (mode == transport::RemoteNamedPipeClient::ReadMode::Message)
+                    ? s.rclient->ReadMessage(rx_more, kMax, kWaitMs)
+                    : s.rclient->ReadSome(rx_more, kMax, kWaitMs);
+                if (!read_ok && !s.rclient->LastError().empty())
+                    pipetap::log::App.Error((std::string("[replay] remote read note: ") + s.rclient->LastError()).c_str());
+            }
+            else if (s.client) {
+                auto mode = s.client->Mode();
+                read_ok = (mode == transport::NamedPipeClient::ReadMode::Message)
+                    ? s.client->ReadMessage(rx_more, kMax, kWaitMs)
+                    : s.client->ReadSome(rx_more, kMax, kWaitMs);
+                if (!read_ok && !s.client->LastError().empty())
+                    pipetap::log::App.Error((std::string("[replay] read note: ") + s.client->LastError()).c_str());
+            }
+
+            if (!rx_more.empty()) {
+                s.rx_text += rx_more;
+
+                pipetap::sharedui::MsgLogEntry ent;
+                ent.id = nextId++;
+                ent.time = pipetap::sharedui::NowTimeString();
+                ent.pipe = (s.target_pipe[0] ? std::string(s.target_pipe) : std::string("(pipe)"));
+                ent.dir = pipetap::sharedui::Direction::In;
+                ent.size = rx_more.size();
+
+                std::vector<uint8_t> rx_bytes(rx_more.begin(), rx_more.end());
+                ent.data = pipetap::sharedui::MakePrintablePreview(rx_bytes);
+                ent.snippet = pipetap::sharedui::MakeSnippet(ent.data);
+                ent.raw.assign(rx_bytes.begin(), rx_bytes.end());
+                ent.is_event = false;
+                ent.winapi = "Read";
+                s.log.push_back(std::move(ent));
+            }
+        }
+    }
+
     static void DrawEditorAndResponse(Tab& tab, uint64_t& nextId)
     {
         using namespace ImGui;
@@ -300,243 +707,7 @@ namespace pipetap::ui::replay {
         }
 
         BeginChild("##edit_left", ImVec2(left_w, -1), true, editor_flags);
-
-        {
-            AlignTextToFramePadding();
-            TextUnformatted("Request");
-            SameLine();
-            TextDisabled("| Mode:");
-            SameLine();
-            bool hex_sel = s.tx_is_hex;
-            if (pipetap::sharedui::SegmentedToggle("req_mode", "Text", "Hex", hex_sel)) s.tx_is_hex = hex_sel;
-
-            SameLine();
-            BeginDisabled(s.tx_is_hex);
-            TextDisabled("| Encoding:");
-            SameLine();
-            bool wide_sel = s.tx_text_is_wide;
-            if (pipetap::sharedui::SegmentedToggle("req_enc", "UTF-8", "UTF-16", wide_sel)) {
-                s.tx_text_is_wide = wide_sel;
-                if (!s.tx_is_hex) {
-                    if (s.tx_text_is_wide) Utf8ToUtf16LE(s.tx_buf, s.tx_bytes);
-                    else {
-                        size_t n = std::strlen(s.tx_buf);
-                        s.tx_bytes.assign((const uint8_t*)s.tx_buf, (const uint8_t*)s.tx_buf + n);
-                    }
-                }
-            }
-            EndDisabled();
-
-            SameLine();
-            TextDisabled("| %zu byte(s)", s.tx_bytes.size());
-        }
-
-        Separator();
-
-        {
-            const ImGuiStyle& style = GetStyle();
-            const float footer_extra_pad = style.FramePadding.y;
-            const float reserved_footer = GetFrameHeightWithSpacing() + footer_extra_pad;
-
-            if (s.focus_editor_next) { SetKeyboardFocusHere(); s.focus_editor_next = false; }
-            ImVec2 avail = GetContentRegionAvail();
-            ImVec2 editor_size(-FLT_MIN, std::max(0.0f, avail.y - reserved_footer));
-
-            if (!s.tx_is_hex) {
-                std::string view_utf8 = s.tx_text_is_wide
-                    ? Utf16LEToUtf8(s.tx_bytes)
-                    : std::string((const char*)s.tx_bytes.data(),
-                        (const char*)s.tx_bytes.data() + s.tx_bytes.size());
-                size_t limit = std::min(view_utf8.size(), sizeof(s.tx_buf) - 1);
-                bool needs = (std::strncmp(s.tx_buf, view_utf8.c_str(), limit) != 0) ||
-                    (std::strlen(s.tx_buf) != limit);
-                if (needs) { std::memset(s.tx_buf, 0, sizeof(s.tx_buf)); if (limit) std::memcpy(s.tx_buf, view_utf8.data(), limit); }
-
-                InputTextMultiline("##tx_text", s.tx_buf, IM_ARRAYSIZE(s.tx_buf),
-                    editor_size,
-                    ImGuiInputTextFlags_AllowTabInput | ImGuiInputTextFlags_NoHorizontalScroll);
-
-                if (s.tx_text_is_wide) Utf8ToUtf16LE(s.tx_buf, s.tx_bytes);
-                else {
-                    size_t n = std::strlen(s.tx_buf);
-                    s.tx_bytes.assign((const uint8_t*)s.tx_buf, (const uint8_t*)s.tx_buf + n);
-                }
-            }
-            else {
-                s.tx_hex.UseDefaultResizeFor(s.tx_bytes);
-                s.tx_hex.OptAutoExtend = true;
-                s.tx_hex.OptShowOptions = true;
-                s.tx_hex.ReadOnly = false;
-
-                BeginChild("##tx_hex_child", editor_size, false,
-                    ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-                void* memptr = s.tx_bytes.empty() ? nullptr : (void*)s.tx_bytes.data();
-                size_t memsz = s.tx_bytes.size();
-                if (s.tx_bytes.empty()) { s.tx_bytes.resize(1, 0); memptr = s.tx_bytes.data(); memsz = 1; }
-                s.tx_hex.DrawContents(memptr, memsz, 0);
-                EndChild();
-
-                std::string view_utf8 = s.tx_text_is_wide ? Utf16LEToUtf8(s.tx_bytes)
-                    : std::string((const char*)s.tx_bytes.data(),
-                        (const char*)s.tx_bytes.data() + s.tx_bytes.size());
-                std::memset(s.tx_buf, 0, sizeof(s.tx_buf));
-                size_t limit = std::min(view_utf8.size(), sizeof(s.tx_buf) - 1);
-                if (limit) std::memcpy(s.tx_buf, view_utf8.data(), limit);
-            }
-        }
-
-        {
-            const ImGuiStyle& st = GetStyle();
-            const float gap = st.ItemInnerSpacing.x;
-
-            const char* L_send_vis = "Send";
-            const char* L_paste_vis = "Paste";
-            const char* L_clear_vis = "Clear TX";
-
-            auto btn_w = [&](const char* vis) { return CalcTextSize(vis).x + st.FramePadding.x * 2.0f; };
-            float total_w = btn_w(L_send_vis) + gap + btn_w(L_paste_vis) + gap + btn_w(L_clear_vis);
-
-            SetCursorPosY(GetCursorPosY() + st.ItemInnerSpacing.y); // top pad like proxy
-
-            float x = GetCursorPosX() + (GetContentRegionAvail().x - total_w);
-            if (x < GetCursorPosX()) x = GetCursorPosX();
-            SetCursorPosX(x);
-
-            bool did_paste = false;
-            bool do_send = false;
-
-            {
-                ImVec4 base = ImVec4(0.20f, 0.65f, 0.20f, 1.0f);
-                ImVec4 hov = ImVec4(0.25f, 0.75f, 0.25f, 1.0f);
-                ImVec4 act = ImVec4(0.18f, 0.58f, 0.18f, 1.0f);
-                PushStyleColor(ImGuiCol_Button, base);
-                PushStyleColor(ImGuiCol_ButtonHovered, hov);
-                PushStyleColor(ImGuiCol_ButtonActive, act);
-                BeginDisabled(!is_connected);
-                if (Button("Send")) do_send = true;
-                EndDisabled();
-                PopStyleColor(3);
-            }
-
-            SameLine(0.0f, gap);
-
-            PushID("req_paste");
-            if (Button("Paste")) {
-                std::vector<uint8_t> clip;
-                if (pipetap::ui::GetClipboardRawBytes(clip)) { s.tx_bytes = std::move(clip); did_paste = true; }
-            }
-            if (IsItemHovered() && IsMouseReleased(ImGuiMouseButton_Right))
-                OpenPopup("paste_popup");
-            if (BeginPopup("paste_popup")) {
-                if (MenuItem("Paste (Base64)")) {
-                    std::vector<uint8_t> raw;
-                    if (pipetap::ui::GetClipboardBase64AsBytes(raw)) { s.tx_bytes = std::move(raw); did_paste = true; }
-                }
-                EndPopup();
-            }
-            PopID();
-
-            SameLine(0.0f, gap);
-            if (Button("Clear TX")) { s.tx_bytes.clear(); s.tx_buf[0] = '\0'; }
-
-            if (did_paste) {
-                std::string view_utf8 = s.tx_text_is_wide ? Utf16LEToUtf8(s.tx_bytes)
-                    : std::string((const char*)s.tx_bytes.data(),
-                        (const char*)s.tx_bytes.data() + s.tx_bytes.size());
-                std::memset(s.tx_buf, 0, sizeof(s.tx_buf));
-                size_t limit = std::min(view_utf8.size(), sizeof(s.tx_buf) - 1);
-                if (limit) std::memcpy(s.tx_buf, view_utf8.data(), limit);
-                s.focus_editor_next = true;
-            }
-
-            if (do_send) {
-                const std::vector<uint8_t>& out = s.tx_bytes;
-                std::string rx;
-
-                if (is_connected) {
-                    if (s.use_remote && s.rclient) {
-                        if (!s.rclient->WriteAll(out.data(), (DWORD)out.size())) {
-                            pipetap::log::App.Error((std::string("[replay] remote write failed: ") + s.rclient->LastError()).c_str());
-                        }
-                        else {
-                            auto mode = s.rclient->Mode();
-                            (void)((mode == transport::RemoteNamedPipeClient::ReadMode::Message)
-                                ? s.rclient->ReadMessage(rx, 1 << 20, 200)
-                                : s.rclient->ReadSome(rx, 1 << 20, 200));
-                        }
-                    }
-                    else if (s.client) {
-                        if (!s.client->WriteAll(out.data(), (DWORD)out.size())) {
-                            pipetap::log::App.Error((std::string("[replay] write failed: ") + s.client->LastError()).c_str());
-                        }
-                        else {
-                            auto mode = s.client->Mode();
-                            (void)((mode == transport::NamedPipeClient::ReadMode::Message)
-                                ? s.client->ReadMessage(rx, 1 << 20, 200)
-                                : s.client->ReadSome(rx, 1 << 20, 200));
-                        }
-                    }
-                }
-
-                uint32_t peer_pid = 0;
-                std::string peer_image;
-                if (!s.use_remote && s.client) {
-                    peer_pid = s.client->ServerPid();
-                    peer_image = s.client->ServerImage();
-                }
-                else if (s.use_remote && s.rclient) {
-                    peer_pid = s.rclient->ServerPid();
-                    peer_image = s.rclient->ServerImage();
-                }
-
-                // TX log entry (always push raw + printable preview)
-                {
-                    pipetap::sharedui::MsgLogEntry tx;
-                    tx.id = nextId++;
-                    tx.time = pipetap::sharedui::NowTimeString();
-                    tx.pipe = (s.target_pipe[0] ? std::string(s.target_pipe) : std::string("(pipe)"));
-                    tx.dir = pipetap::sharedui::Direction::Out;
-                    tx.size = out.size();
-
-                    tx.data = pipetap::sharedui::MakePrintablePreview(out);
-                    tx.snippet = pipetap::sharedui::MakeSnippet(tx.data);
-                    tx.raw.assign(out.begin(), out.end());
-
-                    tx.peer_pid = peer_pid;
-                    tx.peer_image = peer_image;
-
-                    tx.is_event = false;
-                    tx.winapi = "Write";
-
-                    s.log.push_back(std::move(tx));
-                }
-
-                if (!rx.empty()) {
-                    s.rx_text = rx;
-
-                    pipetap::sharedui::MsgLogEntry ent;
-                    ent.id = nextId++;
-                    ent.time = pipetap::sharedui::NowTimeString();
-                    ent.pipe = (s.target_pipe[0] ? std::string(s.target_pipe) : std::string("(pipe)"));
-                    ent.dir = pipetap::sharedui::Direction::In;
-                    ent.size = rx.size();
-
-                    std::vector<uint8_t> rx_bytes(rx.begin(), rx.end());
-                    ent.data = pipetap::sharedui::MakePrintablePreview(rx_bytes);
-                    ent.snippet = pipetap::sharedui::MakeSnippet(ent.data);
-                    ent.raw.assign(rx_bytes.begin(), rx_bytes.end());
-
-                    ent.peer_pid = peer_pid;
-                    ent.peer_image = peer_image;
-
-                    ent.is_event = false;
-                    ent.winapi = "Read";
-
-                    s.log.push_back(std::move(ent));
-                }
-            }
-        }
-
+        DrawRequestPane(s, is_connected, nextId);
         EndChild(); // ##edit_left
 
         SameLine(0.0f, 0.0f);
@@ -549,143 +720,16 @@ namespace pipetap::ui::replay {
 
         SameLine(0.0f, 0.0f);
         BeginChild("##edit_right", ImVec2(right_w, -1), true, editor_flags);
-
-        AlignTextToFramePadding();
-        TextUnformatted("Response");
-        SameLine();
-        TextDisabled("| Mode:");
-        SameLine();
-        bool& rx_is_hex = state.rx_is_hex;
-        (void)pipetap::sharedui::SegmentedToggle("resp_mode", "Text", "Hex", rx_is_hex);
-
-        SameLine();
-        TextDisabled("| %zu byte(s)", s.rx_text.size());
-        SameLine();
-        {
-            const char* L_copy = "Copy...";
-            const char* L_clear = "Clear RX";
-            std::vector<uint8_t> resp_bytes(s.rx_text.begin(), s.rx_text.end());
-            pipetap::ui::DrawCopyPopupForBytes("copy_resp_popup", resp_bytes, L_copy);
-            SameLine();
-            BeginDisabled(s.rx_text.empty());
-            if (Button(L_clear)) s.rx_text.clear();
-            EndDisabled();
-        }
-
-        Separator();
-
-        {
-            const ImGuiStyle& style = GetStyle();
-            const float footer_extra_pad = style.FramePadding.y;
-            const float reserved_footer = GetFrameHeightWithSpacing() + footer_extra_pad;
-
-            ImVec2 avail = GetContentRegionAvail();
-            ImVec2 editor_size(-FLT_MIN, std::max(0.0f, avail.y - reserved_footer));
-
-            if (!rx_is_hex) {
-                const char* rx_cstr = s.rx_text.c_str();
-                InputTextMultiline("##rx_view",
-                    const_cast<char*>(rx_cstr),
-                    (size_t)(s.rx_text.size() + 1),
-                    editor_size,
-                    ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_NoHorizontalScroll);
-            }
-            else {
-                auto& hex = state.rx_hex;
-                std::vector<uint8_t> bytes(s.rx_text.begin(), s.rx_text.end());
-                void* memptr = bytes.empty() ? nullptr : (void*)bytes.data();
-                size_t memsz = bytes.size();
-                if (bytes.empty()) { bytes.resize(1, 0); memptr = bytes.data(); memsz = 1; }
-                BeginChild("##rx_hex_child", editor_size, false,
-                    ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-                hex.ReadOnly = true;
-                hex.DrawContents(memptr, memsz, 0);
-                EndChild();
-            }
-        }
-
-        {
-            const char* L_more = "Read More";
-            const ImGuiStyle& st = GetStyle();
-            float btn_w = CalcTextSize(L_more).x + st.FramePadding.x * 2.0f;
-
-            SetCursorPosY(GetCursorPosY() + st.ItemInnerSpacing.y);
-            float x = GetCursorPosX() + (GetContentRegionAvail().x - btn_w);
-            if (x < GetCursorPosX()) x = GetCursorPosX();
-            SetCursorPosX(x);
-
-            bool pressed = false;
-            BeginDisabled(!is_connected);
-            pressed = Button(L_more);
-            EndDisabled();
-
-            if (IsItemHovered(ImGuiHoveredFlags_DelayNone | ImGuiHoveredFlags_AllowWhenDisabled)) {
-                ImGui::SetTooltip(
-                    "Reading additional bytes is best-effort:\n"
-                    "- If no data is available right now, nothing will happen.\n"
-                    "- Message mode: next complete message if available.\n"
-                    "- Byte mode: may return partial fragments.\n"
-                    "- A short timeout is used; inactivity often returns nothing.\n"
-                    "- Notes/timeouts/errors appear in the Status panel."
-                );
-            }
-
-            if (pressed) {
-                std::string rx_more;
-                bool read_ok = false;
-                constexpr DWORD kMax = 1 << 20, kWaitMs = 50;
-
-                if (s.use_remote && s.rclient) {
-                    auto mode = s.rclient->Mode();
-                    read_ok = (mode == transport::RemoteNamedPipeClient::ReadMode::Message)
-                        ? s.rclient->ReadMessage(rx_more, kMax, kWaitMs)
-                        : s.rclient->ReadSome(rx_more, kMax, kWaitMs);
-                    if (!read_ok && !s.rclient->LastError().empty())
-                        pipetap::log::App.Error((std::string("[replay] remote read note: ") + s.rclient->LastError()).c_str());
-                }
-                else if (s.client) {
-                    auto mode = s.client->Mode();
-                    read_ok = (mode == transport::NamedPipeClient::ReadMode::Message)
-                        ? s.client->ReadMessage(rx_more, kMax, kWaitMs)
-                        : s.client->ReadSome(rx_more, kMax, kWaitMs);
-                    if (!read_ok && !s.client->LastError().empty())
-                        pipetap::log::App.Error((std::string("[replay] read note: ") + s.client->LastError()).c_str());
-                }
-
-                if (!rx_more.empty()) {
-                    s.rx_text += rx_more;
-
-                    pipetap::sharedui::MsgLogEntry ent;
-                    ent.id = nextId++;
-                    ent.time = pipetap::sharedui::NowTimeString();
-                    ent.pipe = (s.target_pipe[0] ? std::string(s.target_pipe) : std::string("(pipe)"));
-                    ent.dir = pipetap::sharedui::Direction::In;
-                    ent.size = rx_more.size();
-
-                    ent.data = pipetap::sharedui::MakePrintablePreview(rx_more);
-                    ent.snippet = pipetap::sharedui::MakeSnippet(ent.data);
-                    ent.raw.assign(rx_more.begin(), rx_more.end());
-
-                    ent.is_event = false;
-                    ent.winapi = "Read";
-
-                    s.log.push_back(std::move(ent));
-                }
-
-            }
-        }
-
+        DrawResponsePane(tab, is_connected, nextId);
         EndChild(); // ##edit_right
+
         EndChild(); // ##replay_editors
     }
 
-    static void DrawTraffic(Tab& t, float reserve_bottom_h)
+    static void DrawTrafficToolbar(Tab& t, ReplayTabState& state)
     {
         using namespace ImGui;
 
-        SeparatorText("Traffic Log");
-
-        ReplayTabState& state = RegisterTabIfNeeded(&t);
         if (Button("Clear")) {
             t.s.log.clear();
             t.s.selected_row = -1;
@@ -708,8 +752,7 @@ namespace pipetap::ui::replay {
         SameLine();
 
         SetNextItemWidth(260.f);
-        bool needle_changed = InputTextWithHint("##flt", "filter", t.s.filter_text, IM_ARRAYSIZE(t.s.filter_text));
-        if (needle_changed) {
+        if (InputTextWithHint("##flt", "filter", t.s.filter_text, IM_ARRAYSIZE(t.s.filter_text))) {
             auto& fc = state.traffic_filter;
             fc.needle_lower = pipetap::sharedui::ToLowerStr(t.s.filter_text);
             fc.dirty = true;
@@ -726,27 +769,36 @@ namespace pipetap::ui::replay {
                 pipetap::log::App.Infof("[replay] Traffic log exported.");
             }
         }
+    }
+
+    static std::vector<int>& BuildTrafficIndices(Tab& t, ReplayTabState& state)
+    {
+        auto& fc = state.traffic_filter;
+        size_t cur_size = t.s.log.size();
+        if (fc.dirty || fc.last_log_size != cur_size) {
+            pipetap::sharedui::RebuildFilterIndices(t.s.log, fc);
+        }
+        return fc.indices;
+    }
+
+    static void DrawTraffic(Tab& t, float reserve_bottom_h)
+    {
+        using namespace ImGui;
+
+        SeparatorText("Traffic Log");
+
+        ReplayTabState& state = RegisterTabIfNeeded(&t);
+        DrawTrafficToolbar(t, state);
 
         BeginChild("##replay_log_child", ImVec2(0, -reserve_bottom_h), false, ImGuiWindowFlags_HorizontalScrollbar);
 
-        // Build/update filtered indices (index-only)
-        std::vector<int>* index_map_ptr = nullptr;
-        {
-            auto& fc = state.traffic_filter;
-            size_t cur_size = t.s.log.size();
-            if (fc.dirty || fc.last_log_size != cur_size) {
-                pipetap::sharedui::RebuildFilterIndices(t.s.log, fc);
-            }
-            index_map_ptr = &fc.indices;
-        }
-        auto& index_map = *index_map_ptr;
+        auto& index_map = BuildTrafficIndices(t, state);
 
-        // SendToReplay callback for row context menu (raw bytes)
         pipetap::sharedui::SendToReplayFn cb = [&](const std::string& pipe, const std::vector<uint8_t>& raw) {
             ReceiveFromOtherTable(t.s, pipe, raw);
             };
 
-        int filtered_sel = -1; // selection within sorted/filtered list
+        int filtered_sel = -1;
         int selected_original_after = -1;
 
         pipetap::sharedui::MsgTableOpts opts;
@@ -756,7 +808,7 @@ namespace pipetap::ui::replay {
             filtered_sel,
             t.s.selected_row,
             "replay_table_indexed",
-            cb,                    // SendToReplayFn
+            cb,
             opts,
             &selected_original_after
         );
@@ -896,27 +948,25 @@ namespace pipetap::ui::replay {
     // ============================================================================
     void StartNewTabFromProxy(Manager& m, const std::string& pipe, const std::vector<uint8_t>& raw)
     {
-        auto tab = std::make_unique<Tab>();
-
+        Tab* tab_raw = CreateBlankTab(m);
+        Tab& tab = *tab_raw;
         // Pre-populate editor + pipe (but do NOT auto-connect)
         if (!pipe.empty()) {
-            size_t n = (std::min)(pipe.size(), sizeof(tab->s.target_pipe) - 1);
-            std::memcpy(tab->s.target_pipe, pipe.data(), n);
-            tab->s.target_pipe[n] = '\0';
+            size_t n = (std::min)(pipe.size(), sizeof(tab.s.target_pipe) - 1);
+            std::memcpy(tab.s.target_pipe, pipe.data(), n);
+            tab.s.target_pipe[n] = '\0';
         }
 
         // Always default to string view; fill both text and bytes.
-        tab->s.tx_is_hex = false;
-        std::memset(tab->s.tx_buf, 0, sizeof(tab->s.tx_buf));
+        tab.s.tx_is_hex = false;
+        std::memset(tab.s.tx_buf, 0, sizeof(tab.s.tx_buf));
         if (!raw.empty()) {
-            size_t n = (std::min)(raw.size(), sizeof(tab->s.tx_buf) - 1);
-            std::memcpy(tab->s.tx_buf, raw.data(), n);
+            size_t n = (std::min)(raw.size(), sizeof(tab.s.tx_buf) - 1);
+            std::memcpy(tab.s.tx_buf, raw.data(), n);
         }
-        tab->s.tx_bytes.assign(raw.begin(), raw.end());
-        tab->s.focus_editor_next = true;
+        tab.s.tx_bytes.assign(raw.begin(), raw.end());
+        tab.s.focus_editor_next = true;
 
-        RegisterTabIfNeeded(tab.get());
-        m.tabs.push_back(std::move(tab));
         m.active = (int)m.tabs.size() - 1;
         pipetap::log::App.Info("[replay] new tab opened from Proxy");
     }
@@ -955,9 +1005,7 @@ namespace pipetap::ui::replay {
     void Draw(Manager& m)
     {
         if (m.tabs.empty()) {
-            auto t = std::make_unique<Tab>();
-            RegisterTabIfNeeded(t.get());
-            m.tabs.push_back(std::move(t));
+            CreateBlankTab(m);
             m.active = 0;
         }
 
@@ -970,40 +1018,8 @@ namespace pipetap::ui::replay {
                 Tab& t = *m.tabs[i];
                 ReplayTabState& state = RegisterTabIfNeeded(&t);
 
-                char unique_id[64];
-                std::snprintf(unique_id, sizeof(unique_id), "replay_tab_%p", (void*)&t);
-
-                char label[256];
-                std::snprintf(label, sizeof(label), "%s##%s", state.title.c_str(), unique_id);
-
                 bool open = true;
-                bool began = ImGui::BeginTabItem(label, (m.tabs.size() > 1) ? &open : nullptr);
-
-                // Right-click context menu for rename (manual; NOT tied to typing)
-                if (ImGui::BeginPopupContextItem()) {
-                    auto& buf = state.title_edit;
-                    ImGui::TextUnformatted("Rename Tab");
-                    ImGui::Separator();
-                    ImGui::InputText("Name", buf.data(), buf.size());
-                    if (ImGui::Button("Apply")) {
-                        std::string new_name = buf.data();
-                        if (new_name.empty()) {
-                            new_name = std::string("#") + std::to_string(state.ordinal);
-                            std::snprintf(buf.data(), buf.size(), "%s", new_name.c_str());
-                        }
-                        state.title = new_name;
-                        ImGui::CloseCurrentPopup();
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button("Reset")) {
-                        std::string def = std::string("#") + std::to_string(state.ordinal);
-                        state.title = def;
-                        std::snprintf(buf.data(), buf.size(), "%s", def.c_str());
-                        ImGui::CloseCurrentPopup();
-                    }
-                    ImGui::EndPopup();
-                }
-
+                bool began = BeginReplayTabItem(t, state, m.tabs.size() > 1, open);
                 if (began) {
                     m.active = i;
                     DrawOneTab(t, /*is_active_panel*/m.panel_focused);
@@ -1023,9 +1039,7 @@ namespace pipetap::ui::replay {
 
             // New tab button
             if (ImGui::TabItemButton("+", ImGuiTabItemFlags_Trailing)) {
-                auto t = std::make_unique<Tab>();
-                RegisterTabIfNeeded(t.get());
-                m.tabs.push_back(std::move(t));
+                CreateBlankTab(m);
                 m.active = (int)m.tabs.size() - 1;
             }
 
