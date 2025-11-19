@@ -57,6 +57,47 @@ namespace pipetap::ui::proxy {
 
     static std::unordered_map<Tab*, TabState> g_tabState;
 
+    struct EditBindings {
+        uint64_t& op;
+        char* buf;
+        size_t buf_size;
+        char* original;
+        size_t original_size;
+        char* pipe;
+        size_t pipe_size;
+    };
+
+    static EditBindings GetEditBindings(Tab& tab, bool is_request_side) {
+        if (is_request_side) {
+            return { tab.s.pending_req_op, tab.s.req_buf, sizeof(tab.s.req_buf),
+                tab.s.req_original, sizeof(tab.s.req_original),
+                tab.s.req_pipe, sizeof(tab.s.req_pipe) };
+        }
+        return { tab.s.pending_resp_op, tab.s.resp_buf, sizeof(tab.s.resp_buf),
+            tab.s.resp_original, sizeof(tab.s.resp_original),
+            tab.s.resp_pipe, sizeof(tab.s.resp_pipe) };
+    }
+
+    static void SnapshotEditBuffers(EditBindings& bindings, std::mutex& edit_mtx,
+        uint64_t& op_out,
+        char* buf_out, size_t buf_out_size,
+        char* orig_out, size_t orig_out_size,
+        char* pipe_out, size_t pipe_out_size)
+    {
+        std::lock_guard<std::mutex> lk(edit_mtx);
+        op_out = bindings.op;
+        std::memcpy(buf_out, bindings.buf, std::min(buf_out_size, bindings.buf_size));
+        std::memcpy(orig_out, bindings.original, std::min(orig_out_size, bindings.original_size));
+        std::memcpy(pipe_out, bindings.pipe, std::min(pipe_out_size, bindings.pipe_size));
+    }
+
+    static void ClearPendingLocked(EditBindings& bindings) {
+        bindings.op = 0;
+        if (bindings.buf_size) bindings.buf[0] = '\0';
+        if (bindings.original_size) bindings.original[0] = '\0';
+        if (bindings.pipe_size) bindings.pipe[0] = '\0';
+    }
+
     static TabState& RegisterTabIfNeeded(Tab* t) {
         IM_ASSERT(t && "RegisterTabIfNeeded called with null Tab*");
         auto [it, inserted] = g_tabState.try_emplace(t);
@@ -140,26 +181,18 @@ namespace pipetap::ui::proxy {
         const bool is_req = is_request_side;
         const char* title = is_req ? "Next Request" : "Next Response";
 
+        EditBindings bindings = GetEditBindings(tab, is_req);
+
         uint64_t op_snapshot = 0;
         char buf_local[4096] = {};
         char orig_local[4096] = {};
         char pipe_local[128] = {};
 
-        {
-            std::lock_guard<std::mutex> lk(tab.s.edit_mtx);
-            if (is_req) {
-                op_snapshot = tab.s.pending_req_op;
-                std::memcpy(buf_local, tab.s.req_buf, sizeof(buf_local));
-                std::memcpy(orig_local, tab.s.req_original, sizeof(orig_local));
-                std::memcpy(pipe_local, tab.s.req_pipe, sizeof(pipe_local));
-            }
-            else {
-                op_snapshot = tab.s.pending_resp_op;
-                std::memcpy(buf_local, tab.s.resp_buf, sizeof(buf_local));
-                std::memcpy(orig_local, tab.s.resp_original, sizeof(orig_local));
-                std::memcpy(pipe_local, tab.s.resp_pipe, sizeof(pipe_local));
-            }
-        }
+        SnapshotEditBuffers(bindings, tab.s.edit_mtx,
+            op_snapshot,
+            buf_local, sizeof(buf_local),
+            orig_local, sizeof(orig_local),
+            pipe_local, sizeof(pipe_local));
 
         TabState& state = RegisterTabIfNeeded(&tab);
         ProxySideState& side = is_req ? state.request : state.response;
@@ -233,8 +266,8 @@ namespace pipetap::ui::proxy {
                     editor_size, ImGuiInputTextFlags_AllowTabInput))
                 {
                     std::lock_guard<std::mutex> lk(tab.s.edit_mtx);
-                    if (is_req)  std::memcpy(tab.s.req_buf, buf_local, sizeof(tab.s.req_buf));
-                    else         std::memcpy(tab.s.resp_buf, buf_local, sizeof(tab.s.resp_buf));
+                    const size_t copy_sz = std::min(sizeof(buf_local), bindings.buf_size);
+                    std::memcpy(bindings.buf, buf_local, copy_sz);
                 }
             }
             else {
@@ -283,6 +316,22 @@ namespace pipetap::ui::proxy {
             if (x < GetCursorPosX()) x = GetCursorPosX();
             SetCursorPosX(x);
 
+            auto send_edit = [&](bool replace) {
+                std::lock_guard<std::mutex> lk(tab.s.edit_mtx);
+                if (!bindings.op) return;
+
+                if (replace) {
+                    auto out = BuildBytesForSend(bindings.buf, is_hex, is_wide, hex_buf);
+                    SendEditReply(tab.client.get(), bindings.op, true, (const char*)out.data(), out.size());
+                }
+                else {
+                    SendEditReply(tab.client.get(), bindings.op, false, nullptr, 0);
+                }
+
+                ClearPendingLocked(bindings);
+                hex_buf.clear();
+            };
+
             int pushed = 0;
             if (modified) {
                 PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.60f, 0.25f, 1.0f)); ++pushed;
@@ -291,21 +340,7 @@ namespace pipetap::ui::proxy {
             }
             BeginDisabled(!modified);
             if (Button(L_replace_id)) {
-                std::lock_guard<std::mutex> lk(tab.s.edit_mtx);
-                if (is_req && tab.s.pending_req_op) {
-                    auto out = BuildBytesForSend(tab.s.req_buf, is_hex, is_wide, hex_buf);
-                    SendEditReply(tab.client.get(), tab.s.pending_req_op, true, (const char*)out.data(), out.size());
-                    tab.s.pending_req_op = 0;
-                    tab.s.req_buf[0] = tab.s.req_original[0] = tab.s.req_pipe[0] = '\0';
-                    hex_buf.clear();
-                }
-                if (!is_req && tab.s.pending_resp_op) {
-                    auto out = BuildBytesForSend(tab.s.resp_buf, is_hex, is_wide, hex_buf);
-                    SendEditReply(tab.client.get(), tab.s.pending_resp_op, true, (const char*)out.data(), out.size());
-                    tab.s.pending_resp_op = 0;
-                    tab.s.resp_buf[0] = tab.s.resp_original[0] = tab.s.resp_pipe[0] = '\0';
-                    hex_buf.clear();
-                }
+                send_edit(true);
             }
             EndDisabled();
             if (pushed) PopStyleColor(pushed);
@@ -316,11 +351,11 @@ namespace pipetap::ui::proxy {
             if (Button(L_reset_id)) {
                 std::lock_guard<std::mutex> lk(tab.s.edit_mtx);
                 if (!is_hex) {
-                    if (is_req)  std::memcpy(tab.s.req_buf, tab.s.req_original, sizeof(tab.s.req_buf));
-                    else         std::memcpy(tab.s.resp_buf, tab.s.resp_original, sizeof(tab.s.resp_buf));
+                    const size_t copy_sz = std::min(bindings.buf_size, bindings.original_size);
+                    std::memcpy(bindings.buf, bindings.original, copy_sz);
                 }
                 else {
-                    auto base = BuildBytesForSend(is_req ? tab.s.req_original : tab.s.resp_original,
+                    auto base = BuildBytesForSend(bindings.original,
                         /*is_hex*/false, is_wide, /*hexbuf*/{});
                     hex_buf.assign(base.begin(), base.end());
                     if (hex_buf.empty()) hex_buf.resize(1, 0);
@@ -330,19 +365,7 @@ namespace pipetap::ui::proxy {
 
             SameLine(0.0f, gap);
             if (Button(L_pass_id)) {
-                std::lock_guard<std::mutex> lk(tab.s.edit_mtx);
-                if (is_req && tab.s.pending_req_op) {
-                    SendEditReply(tab.client.get(), tab.s.pending_req_op, false, nullptr, 0);
-                    tab.s.pending_req_op = 0;
-                    tab.s.req_buf[0] = tab.s.req_original[0] = tab.s.req_pipe[0] = '\0';
-                    hex_buf.clear();
-                }
-                if (!is_req && tab.s.pending_resp_op) {
-                    SendEditReply(tab.client.get(), tab.s.pending_resp_op, false, nullptr, 0);
-                    tab.s.pending_resp_op = 0;
-                    tab.s.resp_buf[0] = tab.s.resp_original[0] = tab.s.resp_pipe[0] = '\0';
-                    hex_buf.clear();
-                }
+                send_edit(false);
             }
         }
 
