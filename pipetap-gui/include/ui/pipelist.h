@@ -41,6 +41,7 @@ namespace pipetap::ui::pipelist {
 
         char  filter[96] = {};
         bool  need_refresh = false;
+        bool  aggressive = false;            // when true, opens pipes to query PID/inst/type
 
         int   wait_timeout_ms = 80;
 

@@ -133,7 +133,7 @@ namespace pipetap::ui::pipelist {
         return std::string(buf);
     }
 
-    static void FillRowRuntimeInfo(Row& r, int wait_ms)
+    static void FillRowRuntimeInfo(Row& r, int wait_ms, bool aggressive)
     {
         r.server_pid = 0;
         r.proc_name[0] = '\0';
@@ -152,8 +152,20 @@ namespace pipetap::ui::pipelist {
         r.acl_network_access = false;
 
         const std::wstring wpath = Utf8ToWide(r.path.c_str());
-
         const DWORD kWait = (wait_ms >= 0) ? (DWORD)wait_ms : 20;
+
+        // Safe enumeration: avoid touching pipe endpoints entirely to not disturb fragile servers.
+        if (!aggressive) {
+            r.state = Row::PipeState::Unknown;
+            r.open_err = 0;
+            r.dacl = "(not queried; safe mode)";
+            r.dacl_preview = "not queried (safe mode)";
+            r.acl_err = 0;
+            r.ace_count = -1;
+            r.acl_risk_level = -1;
+            r.acl_network_access = false;
+            return;
+        }
 
         BOOL wait_ok = WaitNamedPipeW(wpath.c_str(), kWait);
         if (!wait_ok) {
@@ -253,14 +265,12 @@ namespace pipetap::ui::pipelist {
         if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
     }
 
-    static void DoEnumerateOnce(VM& vm, std::stop_token st, std::vector<Row>& out_rows) {
+    static void DoEnumerateOnce(std::stop_token st, std::vector<Row>& out_rows, int wait_ms, bool aggressive) {
         std::vector<std::string> names;
         EnumeratePipeNames(names);
 
         out_rows.clear();
         out_rows.resize(names.size());
-
-        const int wait_ms = vm.wait_timeout_ms;
 
         unsigned hc = std::max(2u, std::thread::hardware_concurrency());
         const unsigned kMaxWorkers = 8;
@@ -277,7 +287,7 @@ namespace pipetap::ui::pipelist {
                 r.name = names[i];
                 r.path = std::string(R"(\\.\pipe\)") + r.name;
 
-                FillRowRuntimeInfo(r, wait_ms);
+                FillRowRuntimeInfo(r, wait_ms, aggressive);
 
                 out_rows[i] = std::move(r);
             }
@@ -304,7 +314,10 @@ namespace pipetap::ui::pipelist {
         vm.resolving.store(true, std::memory_order_release);
         vm.resolving_started_at = ImGui::GetTime();
 
-        vm.worker = std::jthread([&vm](std::stop_token st) {
+        const int wait_ms = vm.wait_timeout_ms;
+        const bool aggressive = vm.aggressive;
+
+        vm.worker = std::jthread([&vm, wait_ms, aggressive](std::stop_token st) {
             struct ScopeReset {
                 std::atomic<bool>& flag;
                 ~ScopeReset() { flag.store(false, std::memory_order_release); }
@@ -313,7 +326,7 @@ namespace pipetap::ui::pipelist {
             if (vm.shutting_down.load(std::memory_order_acquire) || st.stop_requested()) return;
 
             std::vector<Row> fresh;
-            DoEnumerateOnce(vm, st, fresh);
+            DoEnumerateOnce(st, fresh, wait_ms, aggressive);
             if (vm.shutting_down.load(std::memory_order_acquire) || st.stop_requested()) return;
 
             {
@@ -333,7 +346,13 @@ namespace pipetap::ui::pipelist {
         ImGui::InputTextWithHint("##pl_filter", "filter (name/process/acl)", vm.filter, IM_ARRAYSIZE(vm.filter));
         ImGui::SameLine();
         if (ImGui::Button("Refresh")) vm.need_refresh = true;
-
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Aggressive (opens pipes)", &vm.aggressive)) {
+            vm.need_refresh = true;
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNone)) {
+            ImGui::SetTooltip("Opens each pipe handle to query PID/instances/type; may disturb servers.");
+        }
         if (vm.resolving.load(std::memory_order_acquire)) {
             ImGui::SameLine();
             float elapsed = (float)(ImGui::GetTime() - vm.resolving_started_at);
@@ -343,8 +362,6 @@ namespace pipetap::ui::pipelist {
             ImGui::SameLine();
             ImGui::TextDisabled("(%.1fs)", elapsed);
         }
-
-        ImGui::Separator();
 
         if (vm.need_refresh && !vm.shutting_down.load(std::memory_order_acquire)) {
             StartRefresh(vm);
@@ -356,6 +373,18 @@ namespace pipetap::ui::pipelist {
             std::lock_guard<std::mutex> lock(vm.rows_mtx);
             snapshot = vm.rows;
         }
+
+        ImGui::SameLine();
+        {
+            char buf[64];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE, "Pipes: %zu", snapshot.size());
+            float text_w = ImGui::CalcTextSize(buf).x;
+            float avail = ImGui::GetContentRegionAvail().x;
+            if (text_w < avail) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - text_w));
+            ImGui::TextDisabled("%s", buf);
+        }
+
+        ImGui::Separator();
 
         std::vector<int> index_map;
         index_map.reserve(snapshot.size());
@@ -544,7 +573,9 @@ namespace pipetap::ui::pipelist {
 
                     ImGui::TableNextColumn();
                     {
-                        RiskEval risk = AssessAclRiskFromText(row.dacl);
+                        RiskEval risk = row.acl_risk_level >= 0
+                            ? RiskEval{ row.acl_risk_level, row.dacl_preview, row.acl_network_access }
+                            : AssessAclRiskFromText(row.dacl);
                         ImU32 col = ColorForAclRiskLevel(risk.level);
                         const std::string& preview = row.dacl_preview.empty()
                             ? MakeAclRiskPreview(row.dacl, row.ace_count)
