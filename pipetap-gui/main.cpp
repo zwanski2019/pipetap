@@ -194,6 +194,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR,
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
     }
 
+    // Gracefully drop any control connections before tearing down ImGui/DirectX
+    pipetap::UIShutdown();
+
     // Cleanup
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

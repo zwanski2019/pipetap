@@ -71,6 +71,7 @@ enum : uint16_t {
     PT_CMD_PROXY_OPEN = 0x1201, // VALUE: PT_ProxyOpen + name bytes
     PT_CMD_PROXY_SEND = 0x1202, // VALUE: PT_ProxySend + data bytes
     PT_CMD_PROXY_CLOSE = 0x1203, // VALUE: PT_ProxyClose
+    PT_CMD_CLIENT_DISCONNECT = 0x12F0, // VALUE: PT_ClientDisconnect (GUI closing)
 };
 
 // PT_HELLO
@@ -160,6 +161,11 @@ struct PT_ProxySend {
 // Close request (GUI -> DLL)
 struct PT_ProxyClose {
     uint64_t session_id;
+};
+
+// GUI notifying DLL that the control client is intentionally dropping
+struct PT_ClientDisconnect {
+    uint32_t reason; // 0 = GUI exit
 };
 
 // Closed event (DLL -> GUI)

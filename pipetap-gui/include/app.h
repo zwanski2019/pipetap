@@ -3,4 +3,5 @@
 namespace pipetap
 {
     void UI();
+    void UIShutdown();
 }

@@ -38,6 +38,12 @@ namespace pipetap::ctrlclient {
         // prevent late UI calls
         { std::lock_guard<std::mutex> lk(cb_mx_); cb_ = nullptr; }
 
+        if (connected.load(std::memory_order_acquire)) {
+            PT_ClientDisconnect bye{};
+            bye.reason = 0;
+            (void)SendControlMessage(PT_CMD_CLIENT_DISCONNECT, &bye, sizeof(bye), nullptr, 0);
+        }
+
         DisconnectHandles(true);
 
         if (reader_.joinable()) {

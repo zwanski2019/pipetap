@@ -623,6 +623,10 @@ namespace pipetap::inject {
                 }
                 break;
 
+            case PT_CMD_CLIENT_DISCONNECT:
+                NamedPipeClient::instance().close_all(/*reason=*/0u, /*win32err=*/0u);
+                break;
+
             default:
                 // Ignore unknown control messages
                 break;

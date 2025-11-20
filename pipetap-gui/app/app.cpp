@@ -25,6 +25,13 @@ namespace pipetap {
     using pipetap::win::IntegrityRidToCStr;
     using pipetap::win::RelaunchAsAdministrator;
 
+    namespace {
+        ui::replay::Manager& ReplayManager() { static ui::replay::Manager replay; return replay; }
+        ui::proxy::Manager& ProxyManager() { static ui::proxy::Manager proxy; return proxy; }
+        injection::VM& InjectorVm() { static injection::VM inj; return inj; }
+        ui::pipelist::VM& PipesVm() { static ui::pipelist::VM pipelist; return pipelist; }
+    }
+
     static void MenuBarRightText(const char* txt, const ImVec4* color = nullptr) {
         float w = ImGui::CalcTextSize(txt).x;
         float full = ImGui::GetWindowContentRegionMax().x;
@@ -44,10 +51,10 @@ namespace pipetap {
     }
 
     void UI() {
-        static ui::replay::Manager   replay;
-        static ui::proxy::Manager    proxy;
-        static injection::VM         inj;
-        static ui::pipelist::VM      pipelist;
+        auto& replay = ReplayManager();
+        auto& proxy = ProxyManager();
+        auto& inj = InjectorVm();
+        auto& pipelist = PipesVm();
 
         // visibility for each panel
         static bool show_replay = true;
@@ -221,5 +228,14 @@ namespace pipetap {
         }
         ImGui::End();
         ImGui::PopStyleVar();
+    }
+
+    void UIShutdown() {
+        auto& proxy = ProxyManager();
+        for (auto& tab : proxy.tabs) {
+            if (tab && tab->client) {
+                tab->client->Stop();
+            }
+        }
     }
 } // namespace pipetap
