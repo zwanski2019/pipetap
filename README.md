@@ -1,4 +1,4 @@
-# pipetap (beta)
+# pipetap
 
 [![Twitter](https://img.shields.io/badge/twitter-%40leonjza-blue.svg)](https://x.com/leonjza)
 [![build-artefacts](https://github.com/sensepost/pipetap/actions/workflows/build.yml/badge.svg)](https://github.com/sensepost/pipetap/actions/workflows/build.yml)
