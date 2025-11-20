@@ -25,7 +25,7 @@ namespace pipetap {
     using pipetap::win::IntegrityRidToCStr;
     using pipetap::win::RelaunchAsAdministrator;
 
-    static void MenuBarRightText(const char* txt) {
+    static void MenuBarRightText(const char* txt, const ImVec4* color = nullptr) {
         float w = ImGui::CalcTextSize(txt).x;
         float full = ImGui::GetWindowContentRegionMax().x;
         float x = full - w - ImGui::GetStyle().ItemSpacing.x;
@@ -33,7 +33,14 @@ namespace pipetap {
         ImGui::SameLine(0.0f, 0.0f);
         ImGui::SetCursorPosX(x);
         ImGui::SetCursorPosY(curY);
-        ImGui::TextUnformatted(txt);
+        if (color) {
+            ImGui::PushStyleColor(ImGuiCol_Text, *color);
+            ImGui::TextUnformatted(txt);
+            ImGui::PopStyleColor();
+        }
+        else {
+            ImGui::TextUnformatted(txt);
+        }
     }
 
     void UI() {
@@ -108,6 +115,10 @@ namespace pipetap {
                         RelaunchAsAdministrator();
                     }
                     ImGui::Separator();
+                    if (ImGui::MenuItem("About pipetap")) {
+                        about_requested = true;
+                    }
+                    ImGui::Separator();
                     if (ImGui::MenuItem("Exit")) PostQuitMessage(0);
                     ImGui::EndMenu();
                 }
@@ -136,20 +147,11 @@ namespace pipetap {
                     if (want_focus_pipelist) { ImGui::SetWindowFocus("Pipelist"); want_focus_pipelist = false; }
                 }
 
-                if (ImGui::BeginMenu("About")) {
-                    if (ImGui::MenuItem("About pipetap")) {
-                        about_requested = true;
-                    }
-                    ImGui::EndMenu();
-                }
-
-                // right aligned IL indicator
-                {
-                    char rightLbl[64];
-                    const bool elevated = session::Session().is_elevated;
-                    _snprintf_s(rightLbl, sizeof(rightLbl), _TRUNCATE,
-                        "Current IL: %s%s", session::Session().il_text, elevated ? " (Admin)" : "");
-                    MenuBarRightText(rightLbl);
+                // right aligned elevation indicator
+                const bool elevated = session::Session().is_elevated;
+                if (elevated) {
+                    const ImVec4 adminColor = ImVec4(1.0f, 0.2f, 0.2f, 1.0f);
+                    MenuBarRightText("Administrator", &adminColor);
                 }
 
                 ImGui::EndMenuBar();
