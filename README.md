@@ -24,6 +24,10 @@
 - **GUI** – a desktop application that connects to one or more PIDs, visualizes traffic, lets you filter, edit, replay, or proxy pipes.
 - **Remote proxy** – open a named pipe *inside* the target process from the GUI and send/receive data without modifying the target’s code.
 
+## Development
+
+Some more information on the structure of this project, along with a control channel protocol diagram can be found in [development](./DEVELOPMENT.md).
+
 ## Binaries
 
 If you prefer not to build your own, you can grab binaries in the releases tab.
