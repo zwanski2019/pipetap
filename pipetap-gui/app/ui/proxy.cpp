@@ -11,6 +11,7 @@
 #include "ui/widgets.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -213,6 +214,15 @@ namespace pipetap::ui::proxy {
             client->SendControlMessage(PT_CMD_EDIT_REPLY, &rep, (uint32_t)sizeof(rep), bytes, (uint32_t)len);
         else
             client->SendControlMessage(PT_CMD_EDIT_REPLY, &rep, (uint32_t)sizeof(rep));
+    }
+
+    static void SendEditFlagsIfConnected(Tab& tab) {
+        if (!tab.client) return;
+        if (!tab.client->connected.load(std::memory_order_acquire)) return;
+        PT_EditFlags flags{};
+        flags.edit_request = tab.edit_requests ? 1 : 0;
+        flags.edit_response = tab.edit_responses ? 1 : 0;
+        tab.client->SendControlMessage(PT_CMD_SET_EDIT, &flags, (uint32_t)sizeof(flags));
     }
 
     static IncomingBuffer* EnsureIncoming(Tab* t) {
@@ -533,6 +543,10 @@ namespace pipetap::ui::proxy {
         }
         if (prev_resp && !tab.edit_responses) {
             CancelPendingEdit(tab, /*request*/false);
+        }
+
+        if (prev_req != tab.edit_requests || prev_resp != tab.edit_responses) {
+            SendEditFlagsIfConnected(tab);
         }
     }
 
@@ -889,6 +903,7 @@ namespace pipetap::ui::proxy {
 
             Tab* target = EnsureTabForPid(mgr, hello.pid);
             target->has_unseen = true;
+            SendEditFlagsIfConnected(*target);
             return;
         }
 

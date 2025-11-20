@@ -162,17 +162,20 @@ namespace pipetap::inject {
             (unsigned long)iosbSt, (unsigned long long)xfer);
 
         if (NT_SUCCESS(iosbSt) && xfer) {
-            ControlServer::instance().send_pipe_io(PT_PIPE_READ, pr.file, pr.buffer,
+            auto& ctrl = ControlServer::instance();
+            ctrl.send_pipe_io(PT_PIPE_READ, pr.file, pr.buffer,
                 (uint32_t)xfer, /*dir=*/0, pr.op_id, "NtReadFile(wait-complete)");
 
-            std::vector<uint8_t> repl; BOOL hasRepl = FALSE;
-            (void)ControlServer::instance().wait_for_edit_and_maybe_replace(pr.op_id, pr.buffer,
-                (DWORD)xfer, repl, &hasRepl);
-            if (hasRepl) {
-                ULONG use = (ULONG)std::min<size_t>(repl.size(), (size_t)pr.length);
-                std::memcpy(pr.buffer, repl.data(), use);
-                if (use < pr.length) std::memset((uint8_t*)pr.buffer + use, 0, pr.length - use);
-                pr.iosb->Information = use;
+            if (ctrl.editing_responses_enabled()) {
+                std::vector<uint8_t> repl; BOOL hasRepl = FALSE;
+                (void)ctrl.wait_for_edit_and_maybe_replace(pr.op_id, pr.buffer,
+                    (DWORD)xfer, repl, &hasRepl);
+                if (hasRepl) {
+                    ULONG use = (ULONG)std::min<size_t>(repl.size(), (size_t)pr.length);
+                    std::memcpy(pr.buffer, repl.data(), use);
+                    if (use < pr.length) std::memset((uint8_t*)pr.buffer + use, 0, pr.length - use);
+                    pr.iosb->Information = use;
+                }
             }
         }
 
@@ -200,11 +203,14 @@ namespace pipetap::inject {
                 Buffer, Length, ByteOffset, Key);
 
         uint64_t op = NewOpId();
-        ControlServer::instance().send_pipe_io(PT_PIPE_WRITE, FileHandle, Buffer, Length, /*dir=*/1, op, "NtWriteFile");
+        auto& ctrl = ControlServer::instance();
+        ctrl.send_pipe_io(PT_PIPE_WRITE, FileHandle, Buffer, Length, /*dir=*/1, op, "NtWriteFile");
 
         std::vector<uint8_t> repl;
         BOOL hasRepl = FALSE;
-        (void)ControlServer::instance().wait_for_edit_and_maybe_replace(op, Buffer, Length, repl, &hasRepl);
+        if (ctrl.editing_requests_enabled()) {
+            (void)ctrl.wait_for_edit_and_maybe_replace(op, Buffer, Length, repl, &hasRepl);
+        }
 
         if (hasRepl) {
             return Real_NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
@@ -237,16 +243,19 @@ namespace pipetap::inject {
             ULONG_PTR xfer = IoStatusBlock->Information;
             if (xfer) {
                 uint64_t op = NewOpId();
-                ControlServer::instance().send_pipe_io(PT_PIPE_READ, FileHandle, Buffer,
+                auto& ctrl = ControlServer::instance();
+                ctrl.send_pipe_io(PT_PIPE_READ, FileHandle, Buffer,
                     (uint32_t)xfer, /*dir=*/0, op, "NtReadFile");
-                std::vector<uint8_t> repl; BOOL hasRepl = FALSE;
-                (void)ControlServer::instance().wait_for_edit_and_maybe_replace(op, Buffer,
-                    (DWORD)xfer, repl, &hasRepl);
-                if (hasRepl) {
-                    ULONG use = (ULONG)std::min<size_t>(repl.size(), (size_t)Length);
-                    std::memcpy(Buffer, repl.data(), use);
-                    if (use < Length) std::memset((uint8_t*)Buffer + use, 0, Length - use);
-                    IoStatusBlock->Information = use;
+                if (ctrl.editing_responses_enabled()) {
+                    std::vector<uint8_t> repl; BOOL hasRepl = FALSE;
+                    (void)ctrl.wait_for_edit_and_maybe_replace(op, Buffer,
+                        (DWORD)xfer, repl, &hasRepl);
+                    if (hasRepl) {
+                        ULONG use = (ULONG)std::min<size_t>(repl.size(), (size_t)Length);
+                        std::memcpy(Buffer, repl.data(), use);
+                        if (use < Length) std::memset((uint8_t*)Buffer + use, 0, Length - use);
+                        IoStatusBlock->Information = use;
+                    }
                 }
             }
 
