@@ -1,7 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <string> 
+#include <utility>
+#include <type_traits>
 #include <vector>
 
 // -----------------------------------------------------------------------------
@@ -102,7 +106,7 @@ struct PT_PipeIo {
     // peer / endpoint info
     uint32_t peer_pid;         // the other side's PID if known (0 if unknown)
     uint8_t  endpoint_role;    // 0 = unknown, 1 = server-end handle, 2 = client-end handle
-    uint8_t  reserved2;        // keep packed alignment simple
+    uint8_t  flags;            // PT_PIO_FLAG_* bits
     uint16_t image_len;        // bytes of UTF-8 peer image basename immediately following API name
 };
 
@@ -178,7 +182,112 @@ struct PT_ProxyClosed {
 
 #pragma pack(pop)
 
+// -------------------------------------------------------------------------
+// Control frame helpers (header + payload container)
+// -------------------------------------------------------------------------
+
+static constexpr uint32_t PT_MAX_CONTROL_VALUE = 512u * 1024u * 1024u;
+
+struct PT_ControlFrame {
+    PT_ControlMessageHeader header{};
+    std::vector<uint8_t> body;
+
+    PT_ControlFrame() = default;
+    explicit PT_ControlFrame(uint16_t type) { header.type = type; header.length = 0; }
+
+    static PT_ControlFrame FromOwned(uint16_t type, std::vector<uint8_t> payload) {
+        PT_ControlFrame f(type);
+        f.body = std::move(payload);
+        f.header.length = static_cast<uint32_t>(f.body.size());
+        return f;
+    }
+
+    template <typename T>
+    static PT_ControlFrame FromStruct(uint16_t type, const T& value) {
+        PT_ControlFrame f(type);
+        f.Append(value);
+        return f;
+    }
+
+    bool IsTooLarge() const { return body.size() > PT_MAX_CONTROL_VALUE; }
+
+    template <typename T>
+    PT_ControlFrame& Append(const T& pod) {
+        static_assert(std::is_trivially_copyable_v<T>, "PT_ControlFrame::Append requires trivially copyable type");
+        return AppendBytes(&pod, sizeof(pod));
+    }
+
+    PT_ControlFrame& AppendBytes(const void* data, size_t len) {
+        if (!data || len == 0) return *this;
+
+        const size_t new_size = body.size() + len;
+        if (new_size > static_cast<size_t>((std::numeric_limits<uint32_t>::max)())) return *this;
+        if (new_size > PT_MAX_CONTROL_VALUE) return *this;
+
+        const uint8_t* bytes = static_cast<const uint8_t*>(data);
+        body.insert(body.end(), bytes, bytes + len);
+        header.length = static_cast<uint32_t>(body.size());
+        return *this;
+    }
+
+    PT_ControlFrame& AppendVector(const std::vector<uint8_t>& data) {
+        return AppendBytes(data.data(), data.size());
+    }
+
+    std::vector<uint8_t> Serialize() const {
+        std::vector<uint8_t> out;
+        out.resize(sizeof(header) + body.size());
+        std::memcpy(out.data(), &header, sizeof(header));
+        if (!body.empty()) {
+            std::memcpy(out.data() + sizeof(header), body.data(), body.size());
+        }
+        return out;
+    }
+
+    struct Reader {
+        const uint8_t* cur = nullptr;
+        size_t remaining = 0;
+
+        Reader() = default;
+        Reader(const void* data, size_t len)
+            : cur(static_cast<const uint8_t*>(data)), remaining(len) {}
+
+        template <typename T>
+        bool Next(T& out) {
+            static_assert(std::is_trivially_copyable_v<T>, "PT_ControlFrame::Reader::Next requires trivially copyable type");
+            if (remaining < sizeof(T) || !cur) return false;
+            std::memcpy(&out, cur, sizeof(T));
+            cur += sizeof(T);
+            remaining -= sizeof(T);
+            return true;
+        }
+
+        bool NextBytes(uint32_t len, const uint8_t*& view) {
+            if (len == 0) { view = nullptr; return true; }
+            if (!cur || remaining < len) return false;
+            view = cur;
+            cur += len;
+            remaining -= len;
+            return true;
+        }
+
+        size_t BytesRemaining() const { return remaining; }
+    };
+
+    Reader AsReader() const { return Reader(body.data(), body.size()); }
+
+    template <typename T>
+    bool TryAs(T& out) const {
+        static_assert(std::is_trivially_copyable_v<T>, "PT_ControlFrame::TryAs requires trivially copyable type");
+        if (body.size() < sizeof(T)) return false;
+        std::memcpy(&out, body.data(), sizeof(T));
+        return true;
+    }
+};
+
 // ---- PipeIo parser helpers ----
+static constexpr uint8_t PT_PIO_FLAG_HAS_PAYLOAD = 0x01;
+
 struct PT_PipeIoView {
     // Names are not NUL-terminated; use len fields.
     const char* pipe_name = nullptr; uint16_t pipe_len = 0;
@@ -191,51 +300,73 @@ struct PT_PipeIoView {
 
 template <typename T> static inline T pt_min_(T a, T b) { return (a < b) ? a : b; }
 
-// Parse a PT_PipeIo control message VALUE buffer into meta + view. Returns true on success.
-inline bool PT_TryParsePipeIo(const void* value, size_t value_len,
-    PT_PipeIo* meta_out, PT_PipeIoView* view_out)
+struct PT_DecodedPipeIo {
+    PT_PipeIo meta{};
+    PT_PipeIoView view{};
+    size_t meta_and_names_len = 0;    // bytes consumed by meta + variable names
+    size_t payload_bytes_in_frame = 0;
+    bool expect_payload = false;
+    bool has_payload = false;
+};
+
+inline bool PT_DecodePipeIo(const void* value, size_t value_len, PT_DecodedPipeIo* out)
 {
-    if (!value || !meta_out || !view_out) return false;
+    if (!value || !out) return false;
+    *out = PT_DecodedPipeIo{};
+
     if (value_len < sizeof(PT_PipeIo)) return false;
 
     const uint8_t* p = static_cast<const uint8_t*>(value);
     const uint8_t* end = p + value_len;
 
-    // Read meta
     PT_PipeIo meta{};
     std::memcpy(&meta, p, sizeof(meta));
     p += sizeof(meta);
 
-    // Bounds for variable parts
-    const size_t needed = static_cast<size_t>(meta.pipe_len)
+    const size_t names_len = static_cast<size_t>(meta.pipe_len)
         + static_cast<size_t>(meta.api_len)
         + static_cast<size_t>(meta.image_len);
-    if (static_cast<size_t>(end - p) < needed) return false;
+    if (static_cast<size_t>(end - p) < names_len) return false;
 
     PT_PipeIoView v{};
 
-    // Pipe name
     if (meta.pipe_len) { v.pipe_name = reinterpret_cast<const char*>(p); v.pipe_len = meta.pipe_len; }
     p += meta.pipe_len;
 
-    // API name
     if (meta.api_len) { v.api_name = reinterpret_cast<const char*>(p); v.api_len = meta.api_len; }
     p += meta.api_len;
 
-    // Peer image basename
     if (meta.image_len) { v.peer_image = reinterpret_cast<const char*>(p); v.image_len = meta.image_len; }
     p += meta.image_len;
 
-    // Payload sample
-    if (p < end) {
-        const uint32_t remaining = static_cast<uint32_t>(end - p);
-        const uint32_t want = pt_min_(meta.sample_size, remaining);
-        v.payload = want ? p : nullptr;
-        v.payload_len = want;
+    const size_t remaining = static_cast<size_t>(end - p);
+    const bool expect_payload = (meta.flags & PT_PIO_FLAG_HAS_PAYLOAD) != 0;
+
+    if (remaining != static_cast<size_t>(meta.sample_size)) {
+        return false; // frame malformed or truncated/overlong
     }
 
-    *meta_out = meta;
-    *view_out = v;
+    v.payload = (remaining && p) ? p : nullptr;
+    v.payload_len = static_cast<uint32_t>(remaining);
+
+    out->meta = meta;
+    out->view = v;
+    out->meta_and_names_len = sizeof(PT_PipeIo) + names_len;
+    out->payload_bytes_in_frame = remaining;
+    out->expect_payload = expect_payload;
+    out->has_payload = (v.payload && v.payload_len > 0);
+    return true;
+}
+
+// Parse a PT_PipeIo control message VALUE buffer into meta + view. Returns true on success.
+inline bool PT_TryParsePipeIo(const void* value, size_t value_len,
+    PT_PipeIo* meta_out, PT_PipeIoView* view_out)
+{
+    if (!meta_out || !view_out) return false;
+    PT_DecodedPipeIo dec{};
+    if (!PT_DecodePipeIo(value, value_len, &dec)) return false;
+    *meta_out = dec.meta;
+    *view_out = dec.view;
     return true;
 }
 
@@ -244,6 +375,39 @@ inline bool PT_TryParsePipeIo(const std::vector<uint8_t>& val,
     PT_PipeIo* meta_out, PT_PipeIoView* view_out)
 {
     return PT_TryParsePipeIo(val.data(), val.size(), meta_out, view_out);
+}
+
+struct PT_PipeIoEnvelope {
+    PT_PipeIo meta{};
+    std::string pipe_name;
+    std::string api_name;
+    std::string peer_image;
+    const uint8_t* payload = nullptr;
+    uint32_t payload_len = 0;
+    uint32_t max_sample = 24u * 1024u;
+};
+
+inline PT_ControlFrame PT_BuildPipeIoMessage(uint16_t type, const PT_PipeIoEnvelope& env)
+{
+    PT_PipeIo meta = env.meta;
+    meta.pipe_len = static_cast<uint16_t>(pt_min_<size_t>(env.pipe_name.size(), 0xFFFF));
+    meta.api_len = static_cast<uint16_t>(pt_min_<size_t>(env.api_name.size(), 0xFFFF));
+    meta.image_len = static_cast<uint16_t>(pt_min_<size_t>(env.peer_image.size(), 0xFFFF));
+
+    const uint32_t sample = pt_min_(env.payload_len, env.max_sample);
+    meta.sample_size = sample;
+    if (sample > 0) meta.flags |= PT_PIO_FLAG_HAS_PAYLOAD;
+    else            meta.flags &= ~PT_PIO_FLAG_HAS_PAYLOAD;
+
+    PT_ControlFrame frame(type);
+    frame.Append(meta);
+
+    if (meta.pipe_len)  frame.AppendBytes(env.pipe_name.data(), meta.pipe_len);
+    if (meta.api_len)   frame.AppendBytes(env.api_name.data(), meta.api_len);
+    if (meta.image_len) frame.AppendBytes(env.peer_image.data(), meta.image_len);
+    if (sample && env.payload) frame.AppendBytes(env.payload, sample);
+
+    return frame;
 }
 
 

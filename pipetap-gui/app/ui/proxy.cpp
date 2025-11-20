@@ -210,10 +210,13 @@ namespace pipetap::ui::proxy {
         rep.op_id = op_id;
         rep.action = replace ? 1 : 0;
         rep.new_size = replace ? (uint32_t)len : 0;
-        if (replace && bytes && len)
-            client->SendControlMessage(PT_CMD_EDIT_REPLY, &rep, (uint32_t)sizeof(rep), bytes, (uint32_t)len);
-        else
-            client->SendControlMessage(PT_CMD_EDIT_REPLY, &rep, (uint32_t)sizeof(rep));
+
+        PT_ControlFrame frame(PT_CMD_EDIT_REPLY);
+        frame.Append(rep);
+        if (replace && bytes && len) {
+            frame.AppendBytes(bytes, len);
+        }
+        client->SendControlMessage(frame);
     }
 
     static void SendEditFlagsIfConnected(Tab& tab) {
@@ -222,7 +225,7 @@ namespace pipetap::ui::proxy {
         PT_EditFlags flags{};
         flags.edit_request = tab.edit_requests ? 1 : 0;
         flags.edit_response = tab.edit_responses ? 1 : 0;
-        tab.client->SendControlMessage(PT_CMD_SET_EDIT, &flags, (uint32_t)sizeof(flags));
+        tab.client->SendControlMessage(PT_ControlFrame::FromStruct(PT_CMD_SET_EDIT, flags));
     }
 
     static IncomingBuffer* EnsureIncoming(Tab* t) {
@@ -894,10 +897,11 @@ namespace pipetap::ui::proxy {
         }
     }
 
-    static void OnCtrlMsgWithManager(Manager& mgr, const PT_ControlMessageHeader& hdr, const std::vector<uint8_t>& val)
+    static void OnCtrlMsgWithManager(Manager& mgr, const PT_ControlFrame& frame)
     {
-        if (hdr.type == PT_HELLO && val.size() >= sizeof(PT_Hello)) {
-            PT_Hello hello{}; std::memcpy(&hello, val.data(), sizeof(hello));
+        if (frame.header.type == PT_HELLO) {
+            PT_Hello hello{};
+            if (!frame.TryAs(hello)) return;
             pipetap::log::App.Infof("Proxy: HELLO pid=%lu name='%.*s'", (unsigned long)hello.pid,
                 (int)strnlen(hello.proc_name, sizeof(hello.proc_name)), hello.proc_name);
 
@@ -907,8 +911,9 @@ namespace pipetap::ui::proxy {
             return;
         }
 
-        if (hdr.type == PT_ERROR && val.size() >= sizeof(PT_Error)) {
-            PT_Error e{}; std::memcpy(&e, val.data(), sizeof(e));
+        if (frame.header.type == PT_ERROR) {
+            PT_Error e{};
+            if (!frame.TryAs(e)) return;
             size_t n = strnlen(e.what, sizeof(e.what));
             pipetap::log::App.Errorf("Proxy: ERROR code=%u what='%.*s'", (unsigned)e.code, (int)n, e.what);
             return;
@@ -916,52 +921,60 @@ namespace pipetap::ui::proxy {
 
         // Accept both IO and EVENT control messages here
         const bool is_pipeio_or_event =
-            (hdr.type == PT_PIPE_WRITE || hdr.type == PT_PIPE_READ ||
-                hdr.type == PT_TNP_REQUEST || hdr.type == PT_TNP_RESPONSE ||
-                hdr.type == PT_PIPE_EVENT);
+            (frame.header.type == PT_PIPE_WRITE || frame.header.type == PT_PIPE_READ ||
+                frame.header.type == PT_TNP_REQUEST || frame.header.type == PT_TNP_RESPONSE ||
+                frame.header.type == PT_PIPE_EVENT);
 
         if (is_pipeio_or_event) {
-            PT_PipeIo meta{};
-            PT_PipeIoView view{};
-            if (!PT_TryParsePipeIo(val, &meta, &view)) {
+            PT_DecodedPipeIo decoded{};
+            if (!PT_DecodePipeIo(frame.body.data(), frame.body.size(), &decoded)) {
                 pipetap::log::App.Warnf("Proxy: malformed PT_PipeIo");
                 return;
             }
 
-            std::string pipe_name = (view.pipe_name && view.pipe_len)
-                ? std::string(view.pipe_name, view.pipe_len) : std::string();
-            std::string api_name = (view.api_name && view.api_len)
-                ? std::string(view.api_name, view.api_len) : std::string();
-            std::string peer_img = (view.peer_image && view.image_len)
-                ? std::string(view.peer_image, view.image_len) : std::string();
+            const bool expect_payload = (frame.header.type != PT_PIPE_EVENT) && (decoded.meta.sample_size > 0);
+            const bool has_payload = expect_payload && decoded.view.payload && decoded.view.payload_len > 0;
 
-            Tab* target = EnsureTabForPid(mgr, meta.pid);
+            std::string pipe_name = (decoded.view.pipe_name && decoded.view.pipe_len)
+                ? std::string(decoded.view.pipe_name, decoded.view.pipe_len) : std::string();
+            std::string api_name = (decoded.view.api_name && decoded.view.api_len)
+                ? std::string(decoded.view.api_name, decoded.view.api_len) : std::string();
+            std::string peer_img = (decoded.view.peer_image && decoded.view.image_len)
+                ? std::string(decoded.view.peer_image, decoded.view.image_len) : std::string();
+
+            Tab* target = EnsureTabForPid(mgr, decoded.meta.pid);
 
             std::string data_printable;
-            if (hdr.type != PT_PIPE_EVENT && view.payload && view.payload_len) {
+            if (has_payload) {
                 data_printable = pipetap::sharedui::MakePrintablePreview(
-                    reinterpret_cast<const uint8_t*>(view.payload),
-                    static_cast<size_t>(view.payload_len));
+                    reinterpret_cast<const uint8_t*>(decoded.view.payload),
+                    static_cast<size_t>(decoded.view.payload_len));
             }
 
             pipetap::sharedui::Direction dir =
-                (hdr.type == PT_PIPE_READ || hdr.type == PT_TNP_RESPONSE) ? pipetap::sharedui::Direction::In : pipetap::sharedui::Direction::Out;
+                (frame.header.type == PT_PIPE_READ || frame.header.type == PT_TNP_RESPONSE) ? pipetap::sharedui::Direction::In : pipetap::sharedui::Direction::Out;
 
             pipetap::sharedui::MsgLogEntry ent;
-            ent.id = meta.op_id;
+            ent.id = decoded.meta.op_id;
             ent.time = pipetap::sharedui::NowTimeString();
             ent.pipe = pipe_name;
             ent.winapi = api_name;
-            ent.peer_pid = meta.peer_pid;
+            ent.peer_pid = decoded.meta.peer_pid;
             ent.peer_image = peer_img;
             ent.dir = dir;
-            ent.size = (hdr.type == PT_PIPE_EVENT) ? 0u : static_cast<size_t>(meta.total_size);
-            ent.data = (hdr.type == PT_PIPE_EVENT) ? std::string() : data_printable;
-            ent.snippet = pipetap::sharedui::MakeSnippet(ent.data);
-            if (hdr.type != PT_PIPE_EVENT && view.payload && view.payload_len) {
-                ent.raw.assign(view.payload, view.payload + view.payload_len);
+            ent.size = expect_payload ? static_cast<size_t>(decoded.meta.total_size) : 0u;
+            ent.data = has_payload ? data_printable : std::string();
+            ent.snippet = has_payload ? pipetap::sharedui::MakeSnippet(ent.data) : std::string();
+            if (has_payload) {
+                ent.raw.assign(decoded.view.payload, decoded.view.payload + decoded.view.payload_len);
             }
-            ent.is_event = (hdr.type == PT_PIPE_EVENT);
+            ent.is_event = (frame.header.type == PT_PIPE_EVENT);
+            if (frame.header.type == PT_PIPE_EVENT) {
+                ent.size = 0;
+                ent.data.clear();
+                ent.snippet.clear();
+                ent.raw.clear();
+            }
 
             {
                 auto* inc = EnsureIncoming(target);
@@ -970,14 +983,17 @@ namespace pipetap::ui::proxy {
             }
 
             const bool is_io_frame =
-                (hdr.type == PT_PIPE_WRITE || hdr.type == PT_PIPE_READ ||
-                    hdr.type == PT_TNP_REQUEST || hdr.type == PT_TNP_RESPONSE);
+                (frame.header.type == PT_PIPE_WRITE || frame.header.type == PT_PIPE_READ ||
+                    frame.header.type == PT_TNP_REQUEST || frame.header.type == PT_TNP_RESPONSE);
 
             if (is_io_frame) {
-                const bool want_req = (hdr.type == PT_PIPE_WRITE || hdr.type == PT_TNP_REQUEST) && target->edit_requests;
-                const bool want_resp = (hdr.type == PT_PIPE_READ || hdr.type == PT_TNP_RESPONSE) && target->edit_responses;
+                const bool want_req = (frame.header.type == PT_PIPE_WRITE || frame.header.type == PT_TNP_REQUEST) && target->edit_requests;
+                const bool want_resp = (frame.header.type == PT_PIPE_READ || frame.header.type == PT_TNP_RESPONSE) && target->edit_responses;
 
-                if (want_req || want_resp) {
+                if (!has_payload) {
+                    SendEditReply(target->client.get(), decoded.meta.op_id, false, nullptr, 0);
+                }
+                else if (want_req || want_resp) {
                     if (want_req) {
                         std::lock_guard<std::mutex> lk(target->s.edit_mtx);
                         if (target->s.pending_req_op == 0) {
@@ -986,10 +1002,10 @@ namespace pipetap::ui::proxy {
                             target->s.req_buf[n] = '\0';
                             std::memcpy(target->s.req_original, target->s.req_buf, sizeof(target->s.req_original));
                             std::snprintf(target->s.req_pipe, sizeof(target->s.req_pipe), "%s", pipe_name.c_str());
-                            target->s.pending_req_op = meta.op_id;
+                            target->s.pending_req_op = decoded.meta.op_id;
                         }
                         else {
-                            SendEditReply(target->client.get(), meta.op_id, false, nullptr, 0);
+                            SendEditReply(target->client.get(), decoded.meta.op_id, false, nullptr, 0);
                         }
                     }
                     else {
@@ -1000,15 +1016,15 @@ namespace pipetap::ui::proxy {
                             target->s.resp_buf[n] = '\0';
                             std::memcpy(target->s.resp_original, target->s.resp_buf, sizeof(target->s.resp_original));
                             std::snprintf(target->s.resp_pipe, sizeof(target->s.resp_pipe), "%s", pipe_name.c_str());
-                            target->s.pending_resp_op = meta.op_id;
+                            target->s.pending_resp_op = decoded.meta.op_id;
                         }
                         else {
-                            SendEditReply(target->client.get(), meta.op_id, false, nullptr, 0);
+                            SendEditReply(target->client.get(), decoded.meta.op_id, false, nullptr, 0);
                         }
                     }
                 }
                 else {
-                    SendEditReply(target->client.get(), meta.op_id, false, nullptr, 0);
+                    SendEditReply(target->client.get(), decoded.meta.op_id, false, nullptr, 0);
                 }
             }
 
@@ -1019,14 +1035,14 @@ namespace pipetap::ui::proxy {
             pipetap::log::App.Infof(
                 "Proxy: %s type=0x%04x dir=%u pid=%lu tid=%lu total=%u sample=%u is_msg=%u op=%llu outHint=%u inHint=%u pipe='%s' api='%s' peer_pid=%u peer_img='%s'",
                 ent.is_event ? "EVENT" : "PIPEIO",
-                (unsigned)hdr.type, (unsigned)ent.dir,
-                (unsigned long)meta.pid, (unsigned long)meta.tid,
-                (unsigned)meta.total_size, (unsigned)meta.sample_size,
-                (unsigned)meta.is_message_mode,
-                (unsigned long long)meta.op_id,
-                (unsigned)meta.out_buf_hint, (unsigned)meta.in_buf_hint,
+                (unsigned)frame.header.type, (unsigned)ent.dir,
+                (unsigned long)decoded.meta.pid, (unsigned long)decoded.meta.tid,
+                (unsigned)decoded.meta.total_size, (unsigned)decoded.meta.sample_size,
+                (unsigned)decoded.meta.is_message_mode,
+                (unsigned long long)decoded.meta.op_id,
+                (unsigned)decoded.meta.out_buf_hint, (unsigned)decoded.meta.in_buf_hint,
                 pipe_name.c_str(), api_name.c_str(),
-                (unsigned)meta.peer_pid, peer_img.c_str());
+                (unsigned)decoded.meta.peer_pid, peer_img.c_str());
 #endif
             return;
         }
@@ -1036,8 +1052,8 @@ namespace pipetap::ui::proxy {
     }
 
     BoundCtrlHandler BindHandler(Manager& m) {
-        return [&m](const PT_ControlMessageHeader& hdr, const std::vector<uint8_t>& val) {
-            OnCtrlMsgWithManager(m, hdr, val);
+        return [&m](const PT_ControlFrame& frame) {
+            OnCtrlMsgWithManager(m, frame);
             };
     }
 

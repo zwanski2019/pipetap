@@ -12,7 +12,7 @@
 
 namespace pipetap::ctrlclient {
 
-    using CtrlMsgCallback = std::function<void(const PT_ControlMessageHeader&, const std::vector<uint8_t>&)>;
+    using CtrlMsgCallback = std::function<void(const PT_ControlFrame&)>;
 
     class CtrlClient {
     public:
@@ -30,7 +30,7 @@ namespace pipetap::ctrlclient {
         void StartForPid(DWORD pid, CtrlMsgCallback cb);
         void Disconnect() { Stop(); }
 
-        bool SendControlMessage(uint16_t type, const void* v1, uint32_t n1, const void* v2 = nullptr, uint32_t n2 = 0);
+        bool SendControlMessage(const PT_ControlFrame& frame);
 
         std::atomic_bool connected{ false };
 
@@ -73,7 +73,7 @@ namespace pipetap::ctrlclient {
         }
         void DisconnectHandles(bool cancel_io);
         bool ConnectToPipes(DWORD cur_pid, const char* display);
-        bool ReadNextMessage(DWORD cur_pid, PT_ControlMessageHeader& hdr, std::vector<uint8_t>& val);
+        bool ReadNextMessage(DWORD cur_pid, PT_ControlFrame& frame);
     };
 
     CtrlClient& Control();

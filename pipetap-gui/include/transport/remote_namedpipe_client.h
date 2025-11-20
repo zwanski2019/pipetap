@@ -89,8 +89,13 @@ namespace pipetap::transport {
             if (target_pipe_.size() > 0xFFFF) target_pipe_.resize(0xFFFF);
             op.name_len = static_cast<uint16_t>(target_pipe_.size());
 
-            if (!SendControlMessage_(PT_CMD_PROXY_OPEN, &op, sizeof(op),
-                target_pipe_.data(), (uint32_t)target_pipe_.size())) {
+            PT_ControlFrame open_frame(PT_CMD_PROXY_OPEN);
+            open_frame.Append(op);
+            if (!target_pipe_.empty()) {
+                open_frame.AppendBytes(target_pipe_.data(), target_pipe_.size());
+            }
+
+            if (!SendControlFrame_(open_frame)) {
                 Disconnect();
                 return false;
             }
@@ -156,7 +161,8 @@ namespace pipetap::transport {
         void Disconnect() {
             if (session_id_ != 0 && hCmd_ && hCmd_ != INVALID_HANDLE_VALUE) {
                 PT_ProxyClose c{ session_id_ };
-                (void)SendControlMessage_(PT_CMD_PROXY_CLOSE, &c, sizeof(c), nullptr, 0);
+                PT_ControlFrame close_frame = PT_ControlFrame::FromStruct(PT_CMD_PROXY_CLOSE, c);
+                (void)SendControlFrame_(close_frame);
             }
 
             stop_reader_.store(true, std::memory_order_release);
@@ -203,7 +209,10 @@ namespace pipetap::transport {
             { std::ostringstream oss; oss << "write: " << len << " bytes"; LogInfo(oss.str()); }
 
             PT_ProxySend s{ session_id_, len };
-            if (!SendControlMessage_(PT_CMD_PROXY_SEND, &s, sizeof(s), data, len)) {
+            PT_ControlFrame send_frame(PT_CMD_PROXY_SEND);
+            send_frame.Append(s);
+            send_frame.AppendBytes(data, len);
+            if (!SendControlFrame_(send_frame)) {
                 return false;
             }
 
@@ -300,20 +309,15 @@ namespace pipetap::transport {
             return s;
         }
 
-        bool SendControlMessage_(uint16_t type, const void* meta, uint32_t meta_len, const void* bytes, uint32_t bytes_len) {
+        bool SendControlFrame_(const PT_ControlFrame& frame) {
             if (!hCmd_ || hCmd_ == INVALID_HANDLE_VALUE) {
                 last_error_ = "remote: cmd pipe not open";
                 LogError(last_error_);
                 return false;
             }
-            std::vector<::pipetap::ControlMessageFragment> fragments;
-            if (meta_len && meta) fragments.push_back({ meta, meta_len });
-            if (bytes_len && bytes) fragments.push_back({ bytes, bytes_len });
-            auto msg = ::pipetap::BuildControlMessage(type, fragments);
-
             DWORD wrote = 0;
-            BOOL ok = WriteFile(hCmd_, msg.data(), (DWORD)msg.size(), &wrote, nullptr);
-            if (!ok || wrote != msg.size()) {
+            bool ok = ::pipetap::WriteControlFrame(hCmd_, frame, &wrote);
+            if (!ok) {
                 DWORD err = GetLastError();
                 last_error_ = "remote: write cmd failed (" + std::to_string(err) + "): " + HResultMessage(err);
                 LogError(last_error_);
@@ -350,39 +354,29 @@ namespace pipetap::transport {
                 }
                 if (avail < sizeof(PT_ControlMessageHeader)) { Sleep(1); continue; }
 
-                PT_ControlMessageHeader hdr{};
-                if (!::pipetap::PipeReadExact(hEv_, &hdr, static_cast<DWORD>(sizeof(hdr)))) break;
-                if (hdr.length > (512u * 1024u * 1024u)) break;
+                PT_ControlFrame frame;
+                if (!::pipetap::ReadControlFrame(hEv_, frame)) break;
 
-                std::vector<uint8_t> val(hdr.length);
-                if (hdr.length) {
-                    if (!::pipetap::PipeReadExact(hEv_, val.data(), hdr.length)) break;
-                }
-
-                switch (hdr.type) {
+                switch (frame.header.type) {
                 case PT_HELLO:
                     break;
 
                 case PT_EVT_PROXY_OPENED: {
-                    if (val.size() >= sizeof(PT_ProxyOpenResult)) {
-                        PT_ProxyOpenResult r{}; std::memcpy(&r, val.data(), sizeof(r));
-                        if (r.session_id == session_id_) {
-                            std::lock_guard<std::mutex> lk(mx_);
-                            opened_error_ = r.win32_error;
-                            opened_is_msg_ = r.is_message_mode;
-                            opened_out_hint_ = r.out_buf_hint;
-                            opened_in_hint_ = r.in_buf_hint;
-                            opened_result_ready_ = true;
-                            cv_opened_.notify_all();
-                        }
+                    PT_ProxyOpenResult r{};
+                    if (frame.TryAs(r) && r.session_id == session_id_) {
+                        std::lock_guard<std::mutex> lk(mx_);
+                        opened_error_ = r.win32_error;
+                        opened_is_msg_ = r.is_message_mode;
+                        opened_out_hint_ = r.out_buf_hint;
+                        opened_in_hint_ = r.in_buf_hint;
+                        opened_result_ready_ = true;
+                        cv_opened_.notify_all();
                     }
                 } break;
 
                 case PT_EVT_PROXY_CLOSED: {
-                    if (val.size() >= sizeof(PT_ProxyClosed)) {
-                        PT_ProxyClosed c{}; std::memcpy(&c, val.data(), sizeof(c));
-                        if (c.session_id == session_id_) { NotifyClosed_(c.reason, c.win32_error); }
-                    }
+                    PT_ProxyClosed c{};
+                    if (frame.TryAs(c) && c.session_id == session_id_) { NotifyClosed_(c.reason, c.win32_error); }
                 } break;
 
                 case PT_PIPE_EVENT:
@@ -390,20 +384,23 @@ namespace pipetap::transport {
                 case PT_TNP_RESPONSE:
                 case PT_PIPE_WRITE:
                 case PT_TNP_REQUEST: {
-                    PT_PipeIo meta{};
-                    PT_PipeIoView view{};
-                    if (!PT_TryParsePipeIo(val, &meta, &view)) break;
+                    PT_DecodedPipeIo decoded{};
+                    if (!PT_DecodePipeIo(frame.body.data(), frame.body.size(), &decoded)) break;
 
-                    std::string pipeName = (view.pipe_name && view.pipe_len)
-                        ? std::string(view.pipe_name, view.pipe_len)
+                    const bool has_payload = (frame.header.type != PT_PIPE_EVENT)
+                        && decoded.view.payload && decoded.view.payload_len > 0
+                        && decoded.meta.sample_size > 0;
+
+                    std::string pipeName = (decoded.view.pipe_name && decoded.view.pipe_len)
+                        ? std::string(decoded.view.pipe_name, decoded.view.pipe_len)
                         : std::string();
 
-                    maybe_update_peer(meta, view, pipeName);
+                    maybe_update_peer(decoded.meta, decoded.view, pipeName);
 
-                    const bool is_rx = (hdr.type == PT_PIPE_READ || hdr.type == PT_TNP_RESPONSE);
-                    if (is_rx && view.payload && view.payload_len) {
-                        std::string payload(reinterpret_cast<const char*>(view.payload),
-                            reinterpret_cast<const char*>(view.payload) + view.payload_len);
+                    const bool is_rx = (frame.header.type == PT_PIPE_READ || frame.header.type == PT_TNP_RESPONSE);
+                    if (is_rx && has_payload) {
+                        std::string payload(reinterpret_cast<const char*>(decoded.view.payload),
+                            reinterpret_cast<const char*>(decoded.view.payload) + decoded.view.payload_len);
                         {
                             std::lock_guard<std::mutex> lk(mx_);
                             rxq_.push_back(std::move(payload));

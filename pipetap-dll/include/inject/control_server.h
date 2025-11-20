@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "pipetap/controlpipe.h"
+
 namespace pipetap::inject {
 
     class ControlServer {
@@ -60,9 +62,7 @@ namespace pipetap::inject {
 
         void handle_inbound_commands(HANDLE h);
 
-        void send_control_message(uint16_t type,
-            const void* meta, uint32_t meta_len,
-            const void* payload, uint32_t payload_len);
+        void send_control_message(const PT_ControlFrame& frame);
 
         HANDLE create_events_pipe_instance();   // outbound only (we write)
         HANDLE create_commands_pipe_instance(); // inbound only (we read)

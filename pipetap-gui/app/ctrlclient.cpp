@@ -41,7 +41,7 @@ namespace pipetap::ctrlclient {
         if (connected.load(std::memory_order_acquire)) {
             PT_ClientDisconnect bye{};
             bye.reason = 0;
-            (void)SendControlMessage(PT_CMD_CLIENT_DISCONNECT, &bye, sizeof(bye), nullptr, 0);
+            (void)SendControlMessage(PT_ControlFrame::FromStruct(PT_CMD_CLIENT_DISCONNECT, bye));
         }
 
         DisconnectHandles(true);
@@ -76,17 +76,7 @@ namespace pipetap::ctrlclient {
         if (ev_to_close != INVALID_HANDLE_VALUE) CloseHandle(ev_to_close);
     }
 
-    bool CtrlClient::SendControlMessage(uint16_t type, const void* v1, uint32_t n1, const void* v2, uint32_t n2) {
-
-        std::vector<::pipetap::ControlMessageFragment> fragments;
-        size_t expected = 0;
-        if (n1 && v1) ++expected;
-        if (n2 && v2) ++expected;
-        fragments.reserve(expected);
-        if (n1 && v1) fragments.push_back({ v1, n1 });
-        if (n2 && v2) fragments.push_back({ v2, n2 });
-        auto msg = ::pipetap::BuildControlMessage(type, fragments);
-
+    bool CtrlClient::SendControlMessage(const PT_ControlFrame& frame) {
         HANDLE h = INVALID_HANDLE_VALUE;
         {
             std::lock_guard<std::mutex> lk(wr_mtx_);
@@ -97,12 +87,15 @@ namespace pipetap::ctrlclient {
             h = h_cmd_;
         }
 
+        const size_t total_size = sizeof(frame.header) + frame.body.size();
         DWORD wrote = 0;
-        pipetap::log::App.Infof("CtrlClient::SendControlMessage: type=%u total=%lu", (unsigned)type, (unsigned long)msg.size());
-        if (!WriteFile(h, msg.data(), (DWORD)msg.size(), &wrote, nullptr) || wrote != msg.size()) {
+        pipetap::log::App.Infof("CtrlClient::SendControlMessage: type=%u total=%lu",
+            (unsigned)frame.header.type, (unsigned long)total_size);
+
+        if (!::pipetap::WriteControlFrame(h, frame, &wrote)) {
             DWORD le = GetLastError();
             pipetap::log::App.Errorf("CtrlClient::SendControlMessage: write failed wrote=%lu/%lu le=%lu",
-                (unsigned long)wrote, (unsigned long)msg.size(), (unsigned long)le);
+                (unsigned long)wrote, (unsigned long)total_size, (unsigned long)le);
 
             {
                 std::ostringstream os; os << "Write failed on commands pipe: " << FormatLeA(le);
@@ -175,7 +168,7 @@ namespace pipetap::ctrlclient {
         return true;
     }
 
-    bool CtrlClient::ReadNextMessage(DWORD cur_pid, PT_ControlMessageHeader& hdr, std::vector<uint8_t>& val)
+    bool CtrlClient::ReadNextMessage(DWORD cur_pid, PT_ControlFrame& frame)
     {
         HANDLE ev_snapshot = INVALID_HANDLE_VALUE;
         {
@@ -187,28 +180,10 @@ namespace pipetap::ctrlclient {
             return false;
         }
 
-        if (!::pipetap::PipeReadExact(ev_snapshot, &hdr, static_cast<DWORD>(sizeof(hdr)))) {
+        if (!::pipetap::ReadControlFrame(ev_snapshot, frame)) {
             const DWORD le = GetLastError();
-            pipetap::log::App.Errorf("CtrlClient::Loop: header read failed -> disconnect le=%lu", (unsigned long)le);
-            this->SetLastError(cur_pid, std::string("Read header failed: ") + FormatLeA(le));
-
-            DisconnectHandles(false);
-            return false;
-        }
-
-        if (hdr.length > (512u * 1024u * 1024u)) {
-            pipetap::log::App.Errorf("CtrlClient::Loop: invalid length %u -> disconnect", (unsigned)hdr.length);
-            this->SetLastError(cur_pid, "Invalid message length from events pipe");
-
-            DisconnectHandles(false);
-            return false;
-        }
-
-        val.resize(hdr.length);
-        if (hdr.length && !::pipetap::PipeReadExact(ev_snapshot, val.data(), hdr.length)) {
-            const DWORD le = GetLastError();
-            pipetap::log::App.Errorf("CtrlClient::Loop: value read failed -> disconnect le=%lu", (unsigned long)le);
-            this->SetLastError(cur_pid, std::string("Read value failed: ") + FormatLeA(le));
+            pipetap::log::App.Errorf("CtrlClient::Loop: control frame read failed -> disconnect le=%lu", (unsigned long)le);
+            this->SetLastError(cur_pid, std::string("Read control frame failed: ") + FormatLeA(le));
 
             DisconnectHandles(false);
             return false;
@@ -258,9 +233,8 @@ namespace pipetap::ctrlclient {
                 }
             }
 
-            PT_ControlMessageHeader hdr{};
-            std::vector<uint8_t> val;
-            if (!ReadNextMessage(cur_pid, hdr, val)) {
+            PT_ControlFrame frame;
+            if (!ReadNextMessage(cur_pid, frame)) {
                 continue;
             }
 
@@ -273,7 +247,7 @@ namespace pipetap::ctrlclient {
                 local_cb = cb_;
             }
             if (local_cb) {
-                local_cb(hdr, val);
+                local_cb(frame);
             }
         }
 

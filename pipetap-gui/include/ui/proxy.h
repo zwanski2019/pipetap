@@ -67,7 +67,7 @@ namespace pipetap::ui::proxy {
     void StartNewTabAndConnect(Manager& m, std::uint32_t pid);
     void Draw(Manager& m);
 
-    using BoundCtrlHandler = std::function<void(const PT_ControlMessageHeader&, const std::vector<uint8_t>&)>;
+    using BoundCtrlHandler = std::function<void(const PT_ControlFrame&)>;
     BoundCtrlHandler BindHandler(Manager& m);
 
 } // namespace pipetap::ui::proxy

@@ -3,53 +3,13 @@
 #include <Windows.h>
 
 #include <cstdint>
-#include <initializer_list>
-#include <vector>
 #include <cstring>
+#include <utility>
+#include <vector>
 
 #include "pipetap/controlpipe.h"
 
 namespace pipetap {
-
-    struct ControlMessageFragment {
-        const void* data = nullptr;
-        uint32_t length = 0;
-    };
-
-    inline std::vector<uint8_t> BuildControlMessage(uint16_t type,
-        const ControlMessageFragment* fragments, size_t count)
-    {
-        uint32_t total_len = 0;
-        for (size_t i = 0; i < count; ++i) {
-            total_len += fragments[i].length;
-        }
-
-        PT_ControlMessageHeader hdr{ type, total_len };
-        std::vector<uint8_t> msg(sizeof(hdr) + total_len);
-        std::memcpy(msg.data(), &hdr, sizeof(hdr));
-
-        size_t offset = sizeof(hdr);
-        for (size_t i = 0; i < count; ++i) {
-            const ControlMessageFragment& frag = fragments[i];
-            if (frag.length && frag.data) {
-                std::memcpy(msg.data() + offset, frag.data, frag.length);
-            }
-            offset += frag.length;
-        }
-        return msg;
-    }
-
-    inline std::vector<uint8_t> BuildControlMessage(uint16_t type,
-        std::initializer_list<ControlMessageFragment> fragments)
-    {
-        return BuildControlMessage(type, fragments.begin(), fragments.size());
-    }
-
-    inline std::vector<uint8_t> BuildControlMessage(uint16_t type,
-        const std::vector<ControlMessageFragment>& fragments)
-    {
-        return BuildControlMessage(type, fragments.data(), fragments.size());
-    }
 
     inline bool PipeReadExact(HANDLE h, void* buf, DWORD len)
     {
@@ -78,6 +38,35 @@ namespace pipetap {
         }
 
         return true;
+    }
+
+    inline bool ReadControlFrame(HANDLE h, PT_ControlFrame& out)
+    {
+        if (!h || h == INVALID_HANDLE_VALUE) return false;
+
+        PT_ControlMessageHeader hdr{};
+        if (!PipeReadExact(h, &hdr, static_cast<DWORD>(sizeof(hdr)))) return false;
+        if (hdr.length > PT_MAX_CONTROL_VALUE) { SetLastError(ERROR_INVALID_DATA); return false; }
+
+        std::vector<uint8_t> payload(hdr.length);
+        if (hdr.length) {
+            if (!PipeReadExact(h, payload.data(), hdr.length)) return false;
+        }
+
+        out = PT_ControlFrame::FromOwned(hdr.type, std::move(payload));
+        return true;
+    }
+
+    inline bool WriteControlFrame(HANDLE h, const PT_ControlFrame& frame, DWORD* wrote_out = nullptr)
+    {
+        if (!h || h == INVALID_HANDLE_VALUE) return false;
+        if (frame.IsTooLarge()) { SetLastError(ERROR_INVALID_DATA); return false; }
+
+        auto bytes = frame.Serialize();
+        DWORD wrote = 0;
+        const BOOL ok = WriteFile(h, bytes.data(), static_cast<DWORD>(bytes.size()), &wrote, nullptr);
+        if (wrote_out) *wrote_out = wrote;
+        return (ok && wrote == bytes.size());
     }
 
 } // namespace pipetap

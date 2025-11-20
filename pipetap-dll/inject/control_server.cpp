@@ -213,7 +213,7 @@ namespace pipetap::inject {
         strncpy_s(hello.proc_name, sizeof(hello.proc_name), name.c_str(), _TRUNCATE);
         log::printf("SendHello: pid=%lu exe=%s", (unsigned long)hello.pid, hello.proc_name);
 
-        send_control_message(PT_HELLO, &hello, (uint32_t)sizeof(hello), nullptr, 0);
+        send_control_message(PT_ControlFrame::FromStruct(PT_HELLO, hello));
     }
 
     void ControlServer::send_error(uint32_t code, const char* what)
@@ -224,7 +224,7 @@ namespace pipetap::inject {
         e.code = code;
         strncpy_s(e.what, sizeof(e.what), (what ? what : "err"), _TRUNCATE);
 
-        send_control_message(PT_ERROR, &e, (uint32_t)sizeof(e), nullptr, 0);
+        send_control_message(PT_ControlFrame::FromStruct(PT_ERROR, e));
     }
 
     void ControlServer::send_pipe_io(uint16_t message_type, HANDLE pipe,
@@ -233,18 +233,12 @@ namespace pipetap::inject {
         const char* apiName)
     {
         if (!connected_.load(std::memory_order_relaxed)) return;
-        HANDLE hW = atomic_load_handle(ctrl_w_);
-        if (ctrl_broken_.load(std::memory_order_acquire) || !hW || hW == INVALID_HANDLE_VALUE) {
-            connected_.store(false, std::memory_order_release);
-            return;
-        }
 
         uint8_t  is_msg = 0;
         uint32_t outHint = 0, inHint = 0;
         query_pipe_hints(pipe, is_msg, outHint, inHint);
 
         static constexpr uint32_t kMaxSample = 24 * 1024;
-        uint32_t sample = (total > kMaxSample) ? kMaxSample : total;
 
         std::string pipeName = pipe_name_for_handle(pipe);
         if (pipeName.size() > 0xFFFE) pipeName.resize(0xFFFE);
@@ -259,51 +253,27 @@ namespace pipetap::inject {
             if (peerImg.size() > 0xFFFE) peerImg.resize(0xFFFE);
         }
 
-        // Build meta
-        PT_PipeIo meta{};
-        meta.pid = GetCurrentProcessId();
-        meta.tid = GetCurrentThreadId();
-        meta.dir = dir;
-        meta.is_message_mode = is_msg;
-        meta.total_size = total;
-        meta.sample_size = sample;
-        meta.out_buf_hint = outHint;
-        meta.in_buf_hint = inHint;
-        meta.op_id = op_id;
-        meta.pipe_len = static_cast<uint16_t>(pipeName.size());
-        meta.api_len = static_cast<uint16_t>(api.size());
-        meta.peer_pid = peer.pid;
-        meta.endpoint_role = peer.role; // 0=unknown, 1=server-end, 2=client-end
-        meta.image_len = static_cast<uint16_t>(peerImg.size());
+        PT_PipeIoEnvelope env{};
+        env.meta.pid = GetCurrentProcessId();
+        env.meta.tid = GetCurrentThreadId();
+        env.meta.dir = dir;
+        env.meta.is_message_mode = is_msg;
+        env.meta.total_size = total;
+        env.meta.out_buf_hint = outHint;
+        env.meta.in_buf_hint = inHint;
+        env.meta.op_id = op_id;
+        env.meta.peer_pid = peer.pid;
+        env.meta.endpoint_role = peer.role; // 0=unknown, 1=server-end, 2=client-end
 
-        const uint32_t meta_len = (uint32_t)sizeof(meta);
-        const uint32_t name_len = meta.pipe_len;
-        const uint32_t api_len = meta.api_len;
-        const uint32_t image_len = meta.image_len;
-        const uint32_t payload_len = sample;
+        env.pipe_name = pipeName;
+        env.api_name = api;
+        env.peer_image = peerImg;
+        env.payload = static_cast<const uint8_t*>(buf);
+        env.payload_len = (buf && total) ? total : 0;
+        env.max_sample = kMaxSample;
 
-        std::vector<::pipetap::ControlMessageFragment> fragments;
-        fragments.reserve(1 + (name_len ? 1 : 0) + (api_len ? 1 : 0) + (image_len ? 1 : 0) + ((payload_len && buf) ? 1 : 0));
-        fragments.push_back({ &meta, meta_len });
-        if (name_len) fragments.push_back({ pipeName.data(), name_len });
-        if (api_len) fragments.push_back({ api.data(), api_len });
-        if (image_len) fragments.push_back({ peerImg.data(), image_len });
-        if (payload_len && buf) fragments.push_back({ buf, payload_len });
-
-        auto msg = ::pipetap::BuildControlMessage(message_type, fragments);
-
-        AcquireSRWLockExclusive(&ctrl_lock_);
-        {
-            SuppressHooksGuard _guard;
-            DWORD wrote = 0;
-            BOOL ok = WriteFile(hW, msg.data(), (DWORD)msg.size(), &wrote, nullptr);
-            if (!ok || wrote != msg.size()) {
-                ctrl_broken_.store(true, std::memory_order_release);
-                connected_.store(false, std::memory_order_release);
-                (void)atomic_exchange_handle(ctrl_w_, INVALID_HANDLE_VALUE);
-            }
-        }
-        ReleaseSRWLockExclusive(&ctrl_lock_);
+        auto frame = PT_BuildPipeIoMessage(message_type, env);
+        send_control_message(frame);
     }
 
     void ControlServer::send_proxy_opened(uint64_t session_id,
@@ -319,7 +289,7 @@ namespace pipetap::inject {
         r.is_message_mode = is_message_mode;
         r.out_buf_hint = out_hint;
         r.in_buf_hint = in_hint;
-        send_control_message(PT_EVT_PROXY_OPENED, &r, sizeof(r), nullptr, 0);
+        send_control_message(PT_ControlFrame::FromStruct(PT_EVT_PROXY_OPENED, r));
     }
 
     void ControlServer::send_proxy_closed(uint64_t session_id,
@@ -331,7 +301,7 @@ namespace pipetap::inject {
         ev.session_id = session_id;
         ev.reason = reason;
         ev.win32_error = win32_error;
-        send_control_message(PT_EVT_PROXY_CLOSED, &ev, sizeof(ev), nullptr, 0);
+        send_control_message(PT_ControlFrame::FromStruct(PT_EVT_PROXY_CLOSED, ev));
     }
 
     BOOL ControlServer::wait_for_edit_and_maybe_replace(uint64_t op_id,
@@ -454,9 +424,7 @@ namespace pipetap::inject {
             1, 0, 256 * 1024, 0, nullptr);
     }
 
-    void ControlServer::send_control_message(uint16_t type,
-        const void* meta, uint32_t meta_len,
-        const void* payload, uint32_t payload_len)
+    void ControlServer::send_control_message(const PT_ControlFrame& frame)
     {
         if (!connected_.load(std::memory_order_relaxed)) return;
 
@@ -466,17 +434,12 @@ namespace pipetap::inject {
             return;
         }
 
-        std::vector<::pipetap::ControlMessageFragment> fragments;
-        if (meta_len && meta) fragments.push_back({ meta, meta_len });
-        if (payload_len && payload) fragments.push_back({ payload, payload_len });
-        auto msg = ::pipetap::BuildControlMessage(type, fragments);
-
         AcquireSRWLockExclusive(&ctrl_lock_);
         {
             SuppressHooksGuard _guard;
             DWORD wrote = 0;
-            BOOL ok = WriteFile(hW, msg.data(), (DWORD)msg.size(), &wrote, nullptr);
-            if (!ok || wrote != msg.size()) {
+            bool ok = ::pipetap::WriteControlFrame(hW, frame, &wrote);
+            if (!ok) {
                 ctrl_broken_.store(true, std::memory_order_release);
                 connected_.store(false, std::memory_order_release);
                 (void)atomic_exchange_handle(ctrl_w_, INVALID_HANDLE_VALUE);
@@ -498,61 +461,50 @@ namespace pipetap::inject {
             }
             if (totalAvail < sizeof(PT_ControlMessageHeader)) { Sleep(1); continue; }
 
-            PT_ControlMessageHeader hdr{};
+            PT_ControlFrame frame;
             {
                 SuppressHooksGuard _guard;
-                if (!::pipetap::PipeReadExact(h, &hdr, static_cast<DWORD>(sizeof(hdr)))) break;
-            }
-
-            if (hdr.length > (512u * 1024u * 1024u)) break;
-
-            std::vector<uint8_t> val(hdr.length);
-            if (hdr.length) {
-                SuppressHooksGuard _guard;
-                if (!::pipetap::PipeReadExact(h, val.data(), hdr.length)) break;
+                if (!::pipetap::ReadControlFrame(h, frame)) break;
             }
 
             ctrl_broken_.store(false, std::memory_order_release);
             connected_.store(true, std::memory_order_release);
 
-            switch (hdr.type) {
+            switch (frame.header.type) {
             case PT_CMD_SET_EDIT:
-                if (hdr.length >= sizeof(PT_EditFlags)) {
+                {
                     PT_EditFlags fl{};
-                    std::memcpy(&fl, val.data(), sizeof(fl));
-                    edit_req_.store(fl.edit_request ? 1u : 0u, std::memory_order_release);
-                    edit_resp_.store(fl.edit_response ? 1u : 0u, std::memory_order_release);
+                    if (frame.TryAs(fl)) {
+                        edit_req_.store(fl.edit_request ? 1u : 0u, std::memory_order_release);
+                        edit_resp_.store(fl.edit_response ? 1u : 0u, std::memory_order_release);
+                    }
                 }
                 break;
 
             case PT_CMD_EDIT_REPLY:
-                if (hdr.length >= sizeof(PT_EditReply)) {
+                {
+                    PT_ControlFrame::Reader rd = frame.AsReader();
                     PT_EditReply rep{};
-                    std::memcpy(&rep, val.data(), sizeof(rep));
-                    const uint8_t* bytes = nullptr; uint32_t bsz = 0;
-                    if (rep.action == 1) {
-                        size_t off = sizeof(PT_EditReply);
-                        if (hdr.length >= off + rep.new_size) {
-                            bytes = val.data() + off;
-                            bsz = rep.new_size;
-                        }
+                    if (!rd.Next(rep)) break;
+
+                    const uint8_t* bytes = nullptr;
+                    uint32_t bsz = 0;
+                    if (rep.action == 1 && rep.new_size) {
+                        if (!rd.NextBytes(rep.new_size, bytes)) break;
+                        bsz = rep.new_size;
                     }
                     complete_pending(rep.op_id, rep.action, bytes, bsz);
                 }
                 break;
 
             case PT_CMD_PROXY_OPEN:
-                if (hdr.length >= sizeof(PT_ProxyOpen)) {
+                {
+                    PT_ControlFrame::Reader rd = frame.AsReader();
                     PT_ProxyOpen op{};
-                    std::memcpy(&op, val.data(), sizeof(op));
+                    if (!rd.Next(op)) break;
 
-                    const char* name = nullptr;
-                    if (op.name_len) {
-                        size_t off = sizeof(PT_ProxyOpen);
-                        if (hdr.length >= off + op.name_len) {
-                            name = reinterpret_cast<const char*>(val.data() + off);
-                        }
-                    }
+                    const uint8_t* name = nullptr;
+                    if (op.name_len && !rd.NextBytes(op.name_len, name)) break;
 
                     uint32_t win32err = ERROR_INVALID_PARAMETER;
                     bool ok = false;
@@ -564,7 +516,7 @@ namespace pipetap::inject {
                         DWORD le = NamedPipeClient::instance().open_session(
                             *this,
                             op.session_id,
-                            std::string(name, name + op.name_len),
+                            std::string(reinterpret_cast<const char*>(name), reinterpret_cast<const char*>(name) + op.name_len),
                             op.timeout_ms,
                             op.wait_for_server != 0,
                             op.set_message_readmode != 0,
@@ -588,16 +540,17 @@ namespace pipetap::inject {
                 break;
 
             case PT_CMD_PROXY_SEND:
-                if (hdr.length >= sizeof(PT_ProxySend)) {
+                {
+                    PT_ControlFrame::Reader rd = frame.AsReader();
                     PT_ProxySend ps{};
-                    std::memcpy(&ps, val.data(), sizeof(ps));
-                    const uint8_t* data = nullptr;
-                    if (ps.data_size) {
-                        size_t off = sizeof(PT_ProxySend);
-                        if (hdr.length >= off + ps.data_size) data = val.data() + off;
-                    }
+                    if (!rd.Next(ps)) break;
 
-                    if (!data) {
+                    const uint8_t* data = nullptr;
+                    if (ps.data_size && !rd.NextBytes(ps.data_size, data)) {
+                        send_error(2001u, "proxy_send_bad_session");
+                        break;
+                    }
+                    if (ps.data_size == 0 || !data) {
                         send_error(2001u, "proxy_send_bad_session");
                         break;
                     }
@@ -615,11 +568,11 @@ namespace pipetap::inject {
                 break;
 
             case PT_CMD_PROXY_CLOSE:
-                if (hdr.length >= sizeof(PT_ProxyClose)) {
+                {
                     PT_ProxyClose c{};
-                    std::memcpy(&c, val.data(), sizeof(c));
-
-                    NamedPipeClient::instance().close_session(c.session_id, /*reason=*/0u, /*win32err=*/0u);
+                    if (frame.TryAs(c)) {
+                        NamedPipeClient::instance().close_session(c.session_id, /*reason=*/0u, /*win32err=*/0u);
+                    }
                 }
                 break;
 
