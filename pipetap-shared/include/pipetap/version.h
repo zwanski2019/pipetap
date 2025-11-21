@@ -7,9 +7,9 @@ namespace pipetap
 {
 
     // bump here in one place:
-    inline constexpr uint16_t kVerMajor = 0;
+    inline constexpr uint16_t kVerMajor = 1;
     inline constexpr uint16_t kVerMinor = 0;
-    inline constexpr uint16_t kVerPatch = 1;
+    inline constexpr uint16_t kVerPatch = 0;
 
     struct Version
     {
