@@ -46,7 +46,7 @@ Requirements:
 
 - Windows 10/11
 - Visual Studio 2022 (MSVC)
-- [vcpkg](https://github.com/microsoft/vcpkg) bootstrapped and integtated with Visual Studio
+- [vcpkg](https://github.com/microsoft/vcpkg) bootstrapped and integrated with Visual Studio
 
 Building via PowerShell:
 
